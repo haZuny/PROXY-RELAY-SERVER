@@ -195,7 +195,14 @@ namespace ClientInternalPC
                         break;
 
                     case "PING":
+                        // 서버로부터 PING을 받으면 PONG 응답
                         await SendPongAsync();
+                        break;
+
+                    case "PONG":
+                        // 서버로부터 PONG을 받음 (클라이언트가 보낸 PING에 대한 응답)
+                        // 연결이 정상적으로 유지되고 있음을 확인
+                        // 로그는 필요시에만 남김 (너무 많이 남기지 않음)
                         break;
 
                     default:
