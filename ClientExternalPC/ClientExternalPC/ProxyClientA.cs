@@ -60,6 +60,18 @@ namespace ClientExternalPC
             }
         }
 
+        private void LogFilterInfo()
+        {
+            if (_allowedDomains != null && _allowedDomains.Count > 0)
+            {
+                OnLogMessage($"[필터 정보] 허용된 도메인 목록 ({_allowedDomains.Count}개): {string.Join(", ", _allowedDomains)}");
+            }
+            else
+            {
+                OnLogMessage("[필터 정보] 도메인 필터가 설정되지 않았습니다. 모든 도메인이 허용됩니다.");
+            }
+        }
+
         /// <summary>
         /// Relay Server에 연결하고 프록시 서버 시작
         /// </summary>
@@ -84,6 +96,9 @@ namespace ClientExternalPC
 
                 // PING 전송 루프 시작
                 _pingTask = Task.Run(() => SendPingLoopAsync(_cancellationTokenSource.Token));
+
+                // 필터 정보 로그
+                LogFilterInfo();
 
                 OnLogMessage("[시스템] 프록시 서버가 시작되었습니다.");
             }
@@ -125,19 +140,32 @@ namespace ClientExternalPC
         /// </summary>
         private void StartProxyServer()
         {
-            _httpListener = new HttpListener();
-            _httpListener.Prefixes.Add($"http://localhost:{_proxyPort}/");
-            _httpListener.Start();
+            try
+            {
+                _httpListener = new HttpListener();
+                // localhost와 127.0.0.1 모두 리스닝
+                _httpListener.Prefixes.Add($"http://localhost:{_proxyPort}/");
+                _httpListener.Prefixes.Add($"http://127.0.0.1:{_proxyPort}/");
+                _httpListener.Start();
+                OnLogMessage($"[프록시 시작] HTTP 프록시 서버가 시작되었습니다: http://localhost:{_proxyPort} 및 http://127.0.0.1:{_proxyPort}");
+                OnLogMessage($"[프록시 설정] 브라우저 프록시를 127.0.0.1:{_proxyPort}로 설정하세요");
+            }
+            catch (Exception ex)
+            {
+                OnLogMessage($"[프록시 오류] 프록시 서버 시작 실패: {ex.Message}");
+                throw;
+            }
 
             Task.Run(async () =>
             {
-                OnLogMessage($"[프록시 시작] HTTP 프록시 서버가 시작되었습니다: http://localhost:{_proxyPort}");
+                OnLogMessage("[프록시 대기] 요청 대기 중... (브라우저에서 네이버 등에 접속해보세요)");
 
                 while (_isRunning && _httpListener.IsListening)
                 {
                     try
                     {
                         var context = await _httpListener.GetContextAsync();
+                        OnLogMessage("[프록시 수신] 새로운 요청이 들어왔습니다!");
                         _ = Task.Run(() => HandleProxyRequestAsync(context));
                     }
                     catch (Exception ex)
@@ -161,26 +189,31 @@ namespace ClientExternalPC
 
             try
             {
-                // 도메인 필터링 체크
-                if (!ShouldProxyRequest(request.Url))
-                {
-                    response.StatusCode = 403;
-                    response.StatusDescription = "Forbidden - Domain not in filter list";
-                    response.Close();
-                    OnLogMessage($"[필터링 차단] {request.HttpMethod} {request.Url} - 도메인 '{request.Url?.Host}'이(가) 필터 목록에 없습니다");
-                    return;
-                }
-                
-                OnLogMessage($"[필터링 허용] {request.HttpMethod} {request.Url} - 도메인 '{request.Url?.Host}'이(가) 필터를 통과했습니다");
+                // 모든 요청에 대해 로그 기록 (요청이 들어오는지 확인)
+                OnLogMessage($"[요청 수신] {request.HttpMethod} {request.Url} - 도메인: {request.Url?.Host ?? "null"}");
+                OnLogMessage($"[요청 상세] User-Agent: {request.UserAgent ?? "없음"}, RemoteEndPoint: {request.RemoteEndPoint}");
 
-                // CONNECT 메서드 처리 (HTTPS 터널링)
+                // CONNECT 메서드 처리 (HTTPS 터널링) - 필터링 체크 전에 처리
                 if (request.HttpMethod == "CONNECT")
                 {
                     await HandleConnectRequestAsync(context);
                     return;
                 }
 
-                // 일반 HTTP 요청 처리
+                // 도메인 필터링 체크
+                bool shouldProxy = ShouldProxyRequest(request.Url);
+                
+                if (!shouldProxy)
+                {
+                    // 필터링 대상이 아니면 직접 통과 (패싱)
+                    OnLogMessage($"[직접 통과] {request.HttpMethod} {request.Url} - 도메인 '{request.Url?.Host}'이(가) 필터 목록에 없어 직접 통과합니다");
+                    await HandleDirectRequestAsync(context);
+                    return;
+                }
+                
+                OnLogMessage($"[Relay 경유] {request.HttpMethod} {request.Url} - 도메인 '{request.Url?.Host}'이(가) 필터 목록에 있어 Relay Server를 경유합니다");
+
+                // 일반 HTTP 요청 처리 (Relay Server 경유)
                 var sessionId = Guid.NewGuid().ToString();
                 var relayMessage = new RelayMessage
                 {
@@ -213,7 +246,21 @@ namespace ClientExternalPC
 
                 // Relay Server로 전송
                 OnLogMessage($"[요청 전송] {relayMessage.Method} {relayMessage.Url} (SessionId: {sessionId})");
-                await SendMessageAsync(relayMessage);
+                OnLogMessage($"[WebSocket 상태] WebSocket 연결 상태: {_webSocket?.State}");
+                
+                try
+                {
+                    await SendMessageAsync(relayMessage);
+                    OnLogMessage($"[요청 전송 성공] Relay Server로 요청 전송 완료 (SessionId: {sessionId})");
+                }
+                catch (Exception ex)
+                {
+                    OnLogMessage($"[요청 전송 실패] Relay Server로 요청 전송 실패: {ex.Message}");
+                    response.StatusCode = 502;
+                    response.StatusDescription = "Bad Gateway - Failed to send request to relay server";
+                    response.Close();
+                    return;
+                }
 
                 // 응답 대기
                 var tcs = new TaskCompletionSource<RelayMessage>();
@@ -291,6 +338,234 @@ namespace ClientExternalPC
         }
 
         /// <summary>
+        /// 직접 요청 처리 (필터링 대상이 아닌 경우)
+        /// </summary>
+        private async Task HandleDirectRequestAsync(HttpListenerContext context)
+        {
+            var request = context.Request;
+            var response = context.Response;
+
+            try
+            {
+                // 프록시를 명시적으로 비활성화하여 무한 루프 방지
+                var handler = new HttpClientHandler
+                {
+                    UseProxy = false,
+                    Proxy = null
+                };
+                
+                using (var httpClient = new HttpClient(handler))
+                {
+                    // 타임아웃 설정 (30초)
+                    httpClient.Timeout = TimeSpan.FromSeconds(30);
+                    
+                    // 요청 URL 확인 및 로깅
+                    var requestUrl = request.Url;
+                    OnLogMessage($"[직접 요청] 요청 URL 분석 - Scheme: {requestUrl?.Scheme}, Host: {requestUrl?.Host}, Port: {requestUrl?.Port}, Path: {requestUrl?.AbsolutePath}");
+                    
+                    // 요청 생성
+                    var httpRequest = new HttpRequestMessage(new HttpMethod(request.HttpMethod), requestUrl);
+
+                    // 헤더 복사
+                    foreach (string key in request.Headers.AllKeys)
+                    {
+                        if (!key.StartsWith("Proxy-", StringComparison.OrdinalIgnoreCase) &&
+                            !key.Equals("Connection", StringComparison.OrdinalIgnoreCase) &&
+                            !key.Equals("Keep-Alive", StringComparison.OrdinalIgnoreCase) &&
+                            !key.Equals("Host", StringComparison.OrdinalIgnoreCase))
+                        {
+                            try
+                            {
+                                httpRequest.Headers.TryAddWithoutValidation(key, request.Headers[key]);
+                            }
+                            catch { }
+                        }
+                    }
+
+                    // 요청 본문
+                    if (request.HasEntityBody)
+                    {
+                        var contentLength = request.ContentLength64;
+                        OnLogMessage($"[직접 요청] 요청 본문 크기: {contentLength} bytes");
+                        
+                        if (contentLength > 0 && contentLength < 10 * 1024 * 1024) // 10MB 제한
+                        {
+                            var bodyBytes = new byte[contentLength];
+                            var bytesRead = 0;
+                            var totalRead = 0;
+                            
+                            while (totalRead < contentLength && (bytesRead = await request.InputStream.ReadAsync(bodyBytes, totalRead, (int)(contentLength - totalRead))) > 0)
+                            {
+                                totalRead += bytesRead;
+                            }
+                            
+                            if (totalRead > 0)
+                            {
+                                var contentType = request.ContentType ?? "application/octet-stream";
+                                httpRequest.Content = new ByteArrayContent(bodyBytes, 0, totalRead);
+                                httpRequest.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
+                                OnLogMessage($"[직접 요청] 요청 본문 {totalRead} bytes 읽음");
+                            }
+                        }
+                    }
+
+                    // 직접 요청 수행
+                    OnLogMessage($"[직접 요청] {request.HttpMethod} {request.Url} 직접 요청 시작");
+                    var httpResponse = await httpClient.SendAsync(httpRequest);
+                    OnLogMessage($"[직접 응답] {request.HttpMethod} {request.Url} - Status: {httpResponse.StatusCode}");
+
+                    // 응답 헤더 복사
+                    response.StatusCode = (int)httpResponse.StatusCode;
+                    response.StatusDescription = httpResponse.ReasonPhrase;
+
+                    foreach (var header in httpResponse.Headers)
+                    {
+                        try
+                        {
+                            if (header.Key.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase))
+                                continue;
+
+                            response.Headers[header.Key] = string.Join(", ", header.Value);
+                        }
+                        catch { }
+                    }
+
+                    foreach (var header in httpResponse.Content.Headers)
+                    {
+                        try
+                        {
+                            if (header.Key.Equals("Content-Type", StringComparison.OrdinalIgnoreCase))
+                            {
+                                response.ContentType = string.Join(", ", header.Value);
+                            }
+                            else if (header.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                            {
+                                // Content-Length는 자동 설정됨
+                            }
+                            else
+                            {
+                                response.Headers[header.Key] = string.Join(", ", header.Value);
+                            }
+                        }
+                        catch { }
+                    }
+
+                    // 응답 본문 복사
+                    var responseBody = await httpResponse.Content.ReadAsByteArrayAsync();
+                    response.ContentLength64 = responseBody.Length;
+                    await response.OutputStream.WriteAsync(responseBody, 0, responseBody.Length);
+
+                    OnLogMessage($"[직접 응답 완료] {request.HttpMethod} {request.Url} - {responseBody.Length} bytes 전송");
+                }
+
+                response.Close();
+            }
+            catch (Exception ex)
+            {
+                var errorDetails = ex.Message;
+                if (ex.InnerException != null)
+                {
+                    errorDetails += $" (내부 오류: {ex.InnerException.Message})";
+                }
+                OnLogMessage($"[직접 요청 오류] {request.HttpMethod} {request.Url} - 오류: {errorDetails}");
+                OnLogMessage($"[직접 요청 오류 상세] 스택 트레이스: {ex.StackTrace}");
+                try
+                {
+                    response.StatusCode = 502;
+                    response.StatusDescription = "Bad Gateway";
+                    response.Close();
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
+        /// 직접 CONNECT 처리 (필터링 대상이 아닌 경우)
+        /// </summary>
+        private async Task HandleDirectConnectAsync(HttpListenerContext context, string targetHost)
+        {
+            var request = context.Request;
+            var response = context.Response;
+
+            try
+            {
+                // 직접 TCP 연결
+                OnLogMessage($"[CONNECT 직접] {targetHost} 직접 연결 시작");
+                
+                var port = 443; // HTTPS 기본 포트
+                if (request.RawUrl.Contains(":"))
+                {
+                    var parts = request.RawUrl.Split(':');
+                    if (parts.Length > 1 && int.TryParse(parts[1], out int parsedPort))
+                    {
+                        port = parsedPort;
+                    }
+                }
+
+                using (var tcpClient = new System.Net.Sockets.TcpClient())
+                {
+                    await tcpClient.ConnectAsync(targetHost, port);
+                    OnLogMessage($"[CONNECT 직접 성공] {targetHost}:{port} 연결 성공");
+
+                    // CONNECT 성공 응답
+                    response.StatusCode = 200;
+                    response.StatusDescription = "Connection Established";
+                    response.Headers.Add("Connection", "keep-alive");
+                    await response.OutputStream.FlushAsync();
+
+                    // 스트림 터널링 (양방향)
+                    var clientStream = tcpClient.GetStream();
+                    var serverStream = response.OutputStream;
+
+                    // 양방향 스트림 복사
+                    var copyToServer = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var buffer = new byte[4096];
+                            int bytesRead;
+                            while ((bytesRead = await clientStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                            {
+                                await serverStream.WriteAsync(buffer, 0, bytesRead);
+                                await serverStream.FlushAsync();
+                            }
+                        }
+                        catch { }
+                    });
+
+                    var copyFromServer = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var buffer = new byte[4096];
+                            int bytesRead;
+                            while ((bytesRead = await request.InputStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                            {
+                                await clientStream.WriteAsync(buffer, 0, bytesRead);
+                                await clientStream.FlushAsync();
+                            }
+                        }
+                        catch { }
+                    });
+
+                    await Task.WhenAny(copyToServer, copyFromServer);
+                    OnLogMessage($"[CONNECT 직접 종료] {targetHost} 연결 종료");
+                }
+            }
+            catch (Exception ex)
+            {
+                OnLogMessage($"[CONNECT 직접 오류] {targetHost} - 오류: {ex.Message}");
+                try
+                {
+                    response.StatusCode = 502;
+                    response.StatusDescription = "Bad Gateway";
+                    response.Close();
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
         /// CONNECT 요청 처리 (HTTPS 터널링)
         /// </summary>
         private async Task HandleConnectRequestAsync(HttpListenerContext context)
@@ -300,16 +575,80 @@ namespace ClientExternalPC
 
             try
             {
-                // CONNECT 요청에 대한 200 OK 응답
-                response.StatusCode = 200;
-                response.StatusDescription = "Connection Established";
-                response.Headers.Add("Connection", "keep-alive");
-                await response.OutputStream.FlushAsync();
+                // CONNECT 요청의 RawUrl은 "www.naver.com:443" 형식
+                var rawUrl = request.RawUrl ?? "";
+                var targetHost = rawUrl.Split(':')[0];
+                OnLogMessage($"[CONNECT] HTTPS 터널링 요청: {rawUrl} -> {targetHost}");
 
-                // 터널링은 복잡하므로, 여기서는 간단히 처리
-                // 실제로는 스트림을 Relay로 전달해야 함
-                OnLogMessage($"[CONNECT] HTTPS 터널링 요청: {request.RawUrl}");
-                response.Close();
+                // 필터링 체크
+                bool shouldProxy = false;
+                if (!string.IsNullOrEmpty(targetHost))
+                {
+                    var testUrl = new Uri($"https://{targetHost}");
+                    shouldProxy = ShouldProxyRequest(testUrl);
+                    
+                    if (!shouldProxy)
+                    {
+                        // 필터링 대상이 아니면 직접 통과 (패싱)
+                        OnLogMessage($"[CONNECT 직접 통과] 도메인 '{targetHost}'이(가) 필터 목록에 없어 직접 통과합니다");
+                        await HandleDirectConnectAsync(context, targetHost);
+                        return;
+                    }
+                }
+
+                // CONNECT 요청을 Relay Server로 전달
+                var sessionId = Guid.NewGuid().ToString();
+                var relayMessage = new RelayMessage
+                {
+                    Type = "REQUEST",
+                    SessionId = sessionId,
+                    Method = "CONNECT",
+                    Url = $"https://{targetHost}",
+                    Headers = new Dictionary<string, string>()
+                };
+
+                // Relay Server로 전송
+                OnLogMessage($"[CONNECT 전송] Relay Server로 CONNECT 요청 전송: {targetHost}");
+                await SendMessageAsync(relayMessage);
+
+                // 응답 대기
+                var tcs = new TaskCompletionSource<RelayMessage>();
+                _pendingRequests[sessionId] = tcs;
+
+                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10));
+                var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
+
+                if (completedTask == timeoutTask)
+                {
+                    _pendingRequests.Remove(sessionId);
+                    OnLogMessage($"[CONNECT 타임아웃] CONNECT 요청 타임아웃: {targetHost}");
+                    response.StatusCode = 504;
+                    response.StatusDescription = "Gateway Timeout";
+                    response.Close();
+                    return;
+                }
+
+                var relayResponse = await tcs.Task;
+                _pendingRequests.Remove(sessionId);
+
+                if (relayResponse.StatusCode == 200)
+                {
+                    // CONNECT 성공 - 터널링 시작
+                    response.StatusCode = 200;
+                    response.StatusDescription = "Connection Established";
+                    response.Headers.Add("Connection", "keep-alive");
+                    await response.OutputStream.FlushAsync();
+                    OnLogMessage($"[CONNECT 성공] HTTPS 터널링 시작: {targetHost}");
+                    // 실제 터널링은 복잡하므로 여기서는 연결만 확인
+                    response.Close();
+                }
+                else
+                {
+                    OnLogMessage($"[CONNECT 실패] Relay Server 응답: {relayResponse.StatusCode}");
+                    response.StatusCode = relayResponse.StatusCode ?? 502;
+                    response.StatusDescription = relayResponse.Error ?? "Bad Gateway";
+                    response.Close();
+                }
             }
             catch (Exception ex)
             {
@@ -330,18 +669,32 @@ namespace ClientExternalPC
         {
             if (_webSocket?.State != WebSocketState.Open)
             {
-                throw new InvalidOperationException("WebSocket이 연결되지 않았습니다.");
+                var errorMsg = $"WebSocket이 연결되지 않았습니다. 현재 상태: {_webSocket?.State}";
+                OnLogMessage($"[전송 실패] {errorMsg}");
+                throw new InvalidOperationException(errorMsg);
             }
 
-            var json = SerializeMessage(message);
-            var bytes = Encoding.UTF8.GetBytes(json);
+            try
+            {
+                var json = SerializeMessage(message);
+                var bytes = Encoding.UTF8.GetBytes(json);
 
-            await _webSocket.SendAsync(
-                new ArraySegment<byte>(bytes),
-                WebSocketMessageType.Text,
-                true,
-                CancellationToken.None
-            );
+                OnLogMessage($"[WebSocket 전송] 메시지 전송 시도: {message.Type} (크기: {bytes.Length} bytes)");
+
+                await _webSocket.SendAsync(
+                    new ArraySegment<byte>(bytes),
+                    WebSocketMessageType.Text,
+                    true,
+                    CancellationToken.None
+                );
+
+                OnLogMessage($"[WebSocket 전송 성공] 메시지 전송 완료: {message.Type}");
+            }
+            catch (Exception ex)
+            {
+                OnLogMessage($"[WebSocket 전송 실패] 메시지 전송 실패: {ex.Message}");
+                throw;
+            }
         }
 
         /// <summary>
@@ -582,27 +935,40 @@ namespace ClientExternalPC
                 return false;
             }
 
-            // 필터가 없으면 모든 도메인 허용
+            var host = url.Host;
+            OnLogMessage($"[필터링 체크] 도메인 체크 시작: '{host}'");
+
+            // 필터가 없으면 모든 도메인 직접 통과 (Relay 경유 안 함)
             if (_allowedDomains == null || _allowedDomains.Count == 0)
             {
-                OnLogMessage($"[필터링] 필터가 설정되지 않아 모든 도메인 허용: {url.Host}");
-                return true;
+                OnLogMessage($"[필터링] 필터가 설정되지 않아 모든 도메인 직접 통과: {host}");
+                return false;  // false = 직접 통과, true = Relay 경유
             }
 
-            var host = url.Host;
+            OnLogMessage($"[필터링] 허용된 도메인 목록 ({_allowedDomains.Count}개): {string.Join(", ", _allowedDomains)}");
             
             // 정확한 도메인 매칭 또는 서브도메인 매칭
             foreach (var allowedDomain in _allowedDomains)
             {
-                if (host.Equals(allowedDomain, StringComparison.OrdinalIgnoreCase) ||
-                    host.EndsWith("." + allowedDomain, StringComparison.OrdinalIgnoreCase))
+                var trimmedDomain = allowedDomain.Trim();
+                
+                // 정확한 매칭
+                if (host.Equals(trimmedDomain, StringComparison.OrdinalIgnoreCase))
                 {
-                    OnLogMessage($"[필터링 매칭] '{host}'이(가) 허용된 도메인 '{allowedDomain}'과(와) 매칭되었습니다");
+                    OnLogMessage($"[필터링 매칭 성공] '{host}' == '{trimmedDomain}' (정확한 매칭)");
+                    return true;
+                }
+                
+                // 서브도메인 매칭 (예: www.naver.com이 naver.com과 매칭)
+                if (host.EndsWith("." + trimmedDomain, StringComparison.OrdinalIgnoreCase))
+                {
+                    OnLogMessage($"[필터링 매칭 성공] '{host}' ends with '.{trimmedDomain}' (서브도메인 매칭)");
                     return true;
                 }
             }
 
-            OnLogMessage($"[필터링 불일치] '{host}'이(가) 허용된 도메인 목록과 일치하지 않습니다. 허용 목록: {string.Join(", ", _allowedDomains)}");
+            OnLogMessage($"[필터링 불일치] '{host}'이(가) 허용된 도메인 목록과 일치하지 않습니다.");
+            OnLogMessage($"[필터링 불일치] 허용 목록: {string.Join(", ", _allowedDomains)}");
             return false;
         }
 

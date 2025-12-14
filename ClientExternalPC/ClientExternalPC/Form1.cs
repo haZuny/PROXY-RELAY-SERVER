@@ -121,6 +121,32 @@ namespace ClientExternalPC
                 await _proxyClient.StartAsync();
                 _isRunning = true;
 
+                // Windows 시스템 프록시 자동 설정
+                var proxyServer = $"127.0.0.1:{_proxyPort}";
+                var currentProxy = SystemProxyHelper.GetSystemProxy();
+                OnLogMessage($"[시스템 프록시 확인] 현재 시스템 프록시: {currentProxy ?? "없음"}");
+                
+                if (SystemProxyHelper.SetSystemProxy(proxyServer, true))
+                {
+                    OnLogMessage($"[시스템 프록시] Windows 시스템 프록시가 자동으로 설정되었습니다: {proxyServer}");
+                    
+                    // 설정 확인
+                    var verifyProxy = SystemProxyHelper.GetSystemProxy();
+                    if (verifyProxy == proxyServer)
+                    {
+                        OnLogMessage($"[시스템 프록시 확인] 프록시 설정 확인됨: {verifyProxy}");
+                    }
+                    else
+                    {
+                        OnLogMessage($"[시스템 프록시 경고] 프록시 설정 확인 실패. 예상: {proxyServer}, 실제: {verifyProxy ?? "없음"}");
+                    }
+                }
+                else
+                {
+                    OnLogMessage($"[시스템 프록시 경고] 시스템 프록시 자동 설정 실패. 수동으로 설정하세요: {proxyServer}");
+                    OnLogMessage($"[시스템 프록시 안내] Windows 설정 → 네트워크 및 인터넷 → 프록시에서 수동으로 설정하세요");
+                }
+
                 UpdateMenuItems();
                 UpdateToggleButton();
                 notifyIcon1.Icon = SystemIcons.Shield;
@@ -146,6 +172,12 @@ namespace ClientExternalPC
                     _proxyClient = null;
                 }
 
+                // Windows 시스템 프록시 비활성화
+                if (SystemProxyHelper.DisableSystemProxy())
+                {
+                    OnLogMessage("[시스템 프록시] Windows 시스템 프록시가 비활성화되었습니다");
+                }
+
                 _isRunning = false;
                 UpdateMenuItems();
                 UpdateToggleButton();
@@ -157,6 +189,15 @@ namespace ClientExternalPC
             {
                 MessageBox.Show($"프록시 중지 실패: {ex.Message}", "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        private void OnLogMessage(string message)
+        {
+            if (_logForm != null && !_logForm.IsDisposed)
+            {
+                _logForm.AddLog(message);
+            }
+            System.Diagnostics.Debug.WriteLine(message);
         }
 
         private void ProxyClient_LogMessage(object sender, string message)

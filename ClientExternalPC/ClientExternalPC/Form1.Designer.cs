@@ -66,6 +66,7 @@ namespace ClientExternalPC
             // 
             // contextMenuStrip1
             // 
+            this.contextMenuStrip1.ImageScalingSize = new System.Drawing.Size(32, 32);
             this.contextMenuStrip1.Items.AddRange(new System.Windows.Forms.ToolStripItem[] {
             this.시작ToolStripMenuItem,
             this.중지ToolStripMenuItem,
@@ -74,12 +75,12 @@ namespace ClientExternalPC
             this.toolStripSeparator1,
             this.종료ToolStripMenuItem});
             this.contextMenuStrip1.Name = "contextMenuStrip1";
-            this.contextMenuStrip1.Size = new System.Drawing.Size(99, 120);
+            this.contextMenuStrip1.Size = new System.Drawing.Size(139, 200);
             // 
             // 시작ToolStripMenuItem
             // 
             this.시작ToolStripMenuItem.Name = "시작ToolStripMenuItem";
-            this.시작ToolStripMenuItem.Size = new System.Drawing.Size(98, 22);
+            this.시작ToolStripMenuItem.Size = new System.Drawing.Size(138, 38);
             this.시작ToolStripMenuItem.Text = "시작";
             this.시작ToolStripMenuItem.Click += new System.EventHandler(this.시작ToolStripMenuItem_Click);
             // 
@@ -87,86 +88,92 @@ namespace ClientExternalPC
             // 
             this.중지ToolStripMenuItem.Enabled = false;
             this.중지ToolStripMenuItem.Name = "중지ToolStripMenuItem";
-            this.중지ToolStripMenuItem.Size = new System.Drawing.Size(98, 22);
+            this.중지ToolStripMenuItem.Size = new System.Drawing.Size(138, 38);
             this.중지ToolStripMenuItem.Text = "중지";
             this.중지ToolStripMenuItem.Click += new System.EventHandler(this.중지ToolStripMenuItem_Click);
             // 
             // 설정ToolStripMenuItem
             // 
             this.설정ToolStripMenuItem.Name = "설정ToolStripMenuItem";
-            this.설정ToolStripMenuItem.Size = new System.Drawing.Size(98, 22);
+            this.설정ToolStripMenuItem.Size = new System.Drawing.Size(138, 38);
             this.설정ToolStripMenuItem.Text = "설정";
             this.설정ToolStripMenuItem.Click += new System.EventHandler(this.설정ToolStripMenuItem_Click);
             // 
             // 로깅ToolStripMenuItem
             // 
             this.로깅ToolStripMenuItem.Name = "로깅ToolStripMenuItem";
-            this.로깅ToolStripMenuItem.Size = new System.Drawing.Size(98, 22);
+            this.로깅ToolStripMenuItem.Size = new System.Drawing.Size(138, 38);
             this.로깅ToolStripMenuItem.Text = "로깅";
             this.로깅ToolStripMenuItem.Click += new System.EventHandler(this.로깅ToolStripMenuItem_Click);
             // 
             // toolStripSeparator1
             // 
             this.toolStripSeparator1.Name = "toolStripSeparator1";
-            this.toolStripSeparator1.Size = new System.Drawing.Size(95, 6);
+            this.toolStripSeparator1.Size = new System.Drawing.Size(135, 6);
             // 
             // 종료ToolStripMenuItem
             // 
             this.종료ToolStripMenuItem.Name = "종료ToolStripMenuItem";
-            this.종료ToolStripMenuItem.Size = new System.Drawing.Size(98, 22);
+            this.종료ToolStripMenuItem.Size = new System.Drawing.Size(138, 38);
             this.종료ToolStripMenuItem.Text = "종료";
             this.종료ToolStripMenuItem.Click += new System.EventHandler(this.종료ToolStripMenuItem_Click);
+            // 
+            // btnToggle
+            // 
+            this.btnToggle.Font = new System.Drawing.Font("맑은 고딕", 10F, System.Drawing.FontStyle.Bold);
+            this.btnToggle.Location = new System.Drawing.Point(22, 100);
+            this.btnToggle.Margin = new System.Windows.Forms.Padding(6, 6, 6, 6);
+            this.btnToggle.Name = "btnToggle";
+            this.btnToggle.Size = new System.Drawing.Size(223, 80);
+            this.btnToggle.TabIndex = 0;
+            this.btnToggle.Text = "시작";
+            this.btnToggle.UseVisualStyleBackColor = true;
+            // 
+            // lblStatus
+            // 
+            this.lblStatus.AutoSize = true;
+            this.lblStatus.Location = new System.Drawing.Point(22, 220);
+            this.lblStatus.Margin = new System.Windows.Forms.Padding(6, 0, 6, 0);
+            this.lblStatus.Name = "lblStatus";
+            this.lblStatus.Size = new System.Drawing.Size(146, 24);
+            this.lblStatus.TabIndex = 2;
+            this.lblStatus.Text = "상태: 중지됨";
+            // 
+            // btnSettings
+            // 
+            this.btnSettings.Location = new System.Drawing.Point(279, 100);
+            this.btnSettings.Margin = new System.Windows.Forms.Padding(6, 6, 6, 6);
+            this.btnSettings.Name = "btnSettings";
+            this.btnSettings.Size = new System.Drawing.Size(186, 80);
+            this.btnSettings.TabIndex = 1;
+            this.btnSettings.Text = "설정";
+            this.btnSettings.UseVisualStyleBackColor = true;
             // 
             // lblTitle
             // 
             this.lblTitle.AutoSize = true;
             this.lblTitle.Font = new System.Drawing.Font("맑은 고딕", 12F, System.Drawing.FontStyle.Bold);
-            this.lblTitle.Location = new System.Drawing.Point(12, 15);
+            this.lblTitle.Location = new System.Drawing.Point(22, 30);
+            this.lblTitle.Margin = new System.Windows.Forms.Padding(6, 0, 6, 0);
             this.lblTitle.Name = "lblTitle";
-            this.lblTitle.Size = new System.Drawing.Size(120, 21);
+            this.lblTitle.Size = new System.Drawing.Size(239, 45);
+            this.lblTitle.TabIndex = 1;
             this.lblTitle.Text = "Proxy Client A";
-            // 
-            // btnToggle
-            // 
-            this.btnToggle.Font = new System.Drawing.Font("맑은 고딕", 10F, System.Drawing.FontStyle.Bold);
-            this.btnToggle.Location = new System.Drawing.Point(12, 50);
-            this.btnToggle.Name = "btnToggle";
-            this.btnToggle.Size = new System.Drawing.Size(120, 40);
-            this.btnToggle.TabIndex = 0;
-            this.btnToggle.Text = "시작";
-            this.btnToggle.UseVisualStyleBackColor = true;
-            // 
-            // btnSettings
-            // 
-            this.btnSettings.Location = new System.Drawing.Point(150, 50);
-            this.btnSettings.Name = "btnSettings";
-            this.btnSettings.Size = new System.Drawing.Size(100, 40);
-            this.btnSettings.TabIndex = 1;
-            this.btnSettings.Text = "설정";
-            this.btnSettings.UseVisualStyleBackColor = true;
-            // 
-            // lblStatus
-            // 
-            this.lblStatus.AutoSize = true;
-            this.lblStatus.Location = new System.Drawing.Point(12, 110);
-            this.lblStatus.Name = "lblStatus";
-            this.lblStatus.Size = new System.Drawing.Size(120, 12);
-            this.lblStatus.Text = "상태: 중지됨";
             // 
             // Form1
             // 
-            this.AutoScaleDimensions = new System.Drawing.SizeF(7F, 12F);
+            this.AutoScaleDimensions = new System.Drawing.SizeF(13F, 24F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(500, 150);
+            this.ClientSize = new System.Drawing.Size(517, 300);
             this.Controls.Add(this.lblTitle);
             this.Controls.Add(this.btnToggle);
             this.Controls.Add(this.btnSettings);
             this.Controls.Add(this.lblStatus);
             this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog;
+            this.Margin = new System.Windows.Forms.Padding(6, 6, 6, 6);
             this.MaximizeBox = false;
             this.MinimizeBox = false;
             this.Name = "Form1";
-            this.ShowInTaskbar = true;
             this.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen;
             this.Text = "Proxy Client A";
             this.contextMenuStrip1.ResumeLayout(false);

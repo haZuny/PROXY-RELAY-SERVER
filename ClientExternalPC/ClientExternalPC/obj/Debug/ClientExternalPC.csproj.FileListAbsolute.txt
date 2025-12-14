@@ -7,3 +7,4 @@ F:\proxyprog\ClientExternalPC\ClientExternalPC\obj\Debug\ClientExternalPC.csproj
 F:\proxyprog\ClientExternalPC\ClientExternalPC\obj\Debug\ClientExternalPC.csproj.CoreCompileInputs.cache
 F:\proxyprog\ClientExternalPC\ClientExternalPC\obj\Debug\ClientExternalPC.exe
 F:\proxyprog\ClientExternalPC\ClientExternalPC\obj\Debug\ClientExternalPC.pdb
+F:\proxyprog\ClientExternalPC\ClientExternalPC\obj\Debug\ClientExternalPC.Form1.resources
