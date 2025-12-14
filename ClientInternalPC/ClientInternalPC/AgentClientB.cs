@@ -175,7 +175,11 @@ namespace ClientInternalPC
         {
             try
             {
-                var message = JsonConvert.DeserializeObject<RelayMessage>(json);
+                var settings = new JsonSerializerSettings
+                {
+                    NullValueHandling = NullValueHandling.Ignore
+                };
+                var message = JsonConvert.DeserializeObject<RelayMessage>(json, settings);
 
                 if (message == null || string.IsNullOrEmpty(message.Type))
                 {
@@ -343,7 +347,11 @@ namespace ClientInternalPC
 
             try
             {
-                var json = JsonConvert.SerializeObject(message);
+                var settings = new JsonSerializerSettings
+                {
+                    NullValueHandling = NullValueHandling.Ignore
+                };
+                var json = JsonConvert.SerializeObject(message, settings);
                 var bytes = Encoding.UTF8.GetBytes(json);
 
                 ClientWebSocket ws;
