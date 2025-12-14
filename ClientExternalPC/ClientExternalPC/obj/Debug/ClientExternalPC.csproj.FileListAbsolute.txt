@@ -1,0 +1,9 @@
+F:\proxyprog\ClientExternalPC\ClientExternalPC\bin\Debug\ClientExternalPC.exe.config
+F:\proxyprog\ClientExternalPC\ClientExternalPC\bin\Debug\ClientExternalPC.exe
+F:\proxyprog\ClientExternalPC\ClientExternalPC\bin\Debug\ClientExternalPC.pdb
+F:\proxyprog\ClientExternalPC\ClientExternalPC\obj\Debug\ClientExternalPC.csproj.AssemblyReference.cache
+F:\proxyprog\ClientExternalPC\ClientExternalPC\obj\Debug\ClientExternalPC.Properties.Resources.resources
+F:\proxyprog\ClientExternalPC\ClientExternalPC\obj\Debug\ClientExternalPC.csproj.GenerateResource.cache
+F:\proxyprog\ClientExternalPC\ClientExternalPC\obj\Debug\ClientExternalPC.csproj.CoreCompileInputs.cache
+F:\proxyprog\ClientExternalPC\ClientExternalPC\obj\Debug\ClientExternalPC.exe
+F:\proxyprog\ClientExternalPC\ClientExternalPC\obj\Debug\ClientExternalPC.pdb
