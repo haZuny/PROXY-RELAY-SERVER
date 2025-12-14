@@ -85,12 +85,12 @@ namespace ClientExternalPC
                 // PING 전송 루프 시작
                 _pingTask = Task.Run(() => SendPingLoopAsync(_cancellationTokenSource.Token));
 
-                OnLogMessage("프록시 서버가 시작되었습니다.");
+                OnLogMessage("[시스템] 프록시 서버가 시작되었습니다.");
             }
             catch (Exception ex)
             {
                 _isRunning = false;
-                OnLogMessage($"시작 실패: {ex.Message}");
+                OnLogMessage($"[시스템 오류] 시작 실패: {ex.Message}");
                 throw;
             }
         }
@@ -110,12 +110,12 @@ namespace ClientExternalPC
                 _webSocket = new ClientWebSocket();
                 await _webSocket.ConnectAsync(new Uri(wsUrl), CancellationToken.None);
                 OnConnectionStatusChanged(true);
-                OnLogMessage($"Relay Server에 연결되었습니다: {wsUrl.Replace(_accessToken, "***")}");
+                OnLogMessage($"[연결 성공] Relay Server에 연결되었습니다: {wsUrl.Replace(_accessToken, "***")}");
             }
             catch (Exception ex)
             {
                 OnConnectionStatusChanged(false);
-                OnLogMessage($"Relay Server 연결 실패: {ex.Message}");
+                OnLogMessage($"[연결 실패] Relay Server 연결 실패: {ex.Message}");
                 throw;
             }
         }
@@ -131,7 +131,7 @@ namespace ClientExternalPC
 
             Task.Run(async () =>
             {
-                OnLogMessage($"HTTP 프록시 서버가 시작되었습니다: http://localhost:{_proxyPort}");
+                OnLogMessage($"[프록시 시작] HTTP 프록시 서버가 시작되었습니다: http://localhost:{_proxyPort}");
 
                 while (_isRunning && _httpListener.IsListening)
                 {
@@ -144,7 +144,7 @@ namespace ClientExternalPC
                     {
                         if (_isRunning)
                         {
-                            OnLogMessage($"프록시 요청 처리 오류: {ex.Message}");
+                            OnLogMessage($"[요청 오류] 프록시 요청 처리 오류: {ex.Message}");
                         }
                     }
                 }
@@ -167,9 +167,11 @@ namespace ClientExternalPC
                     response.StatusCode = 403;
                     response.StatusDescription = "Forbidden - Domain not in filter list";
                     response.Close();
-                    OnLogMessage($"도메인 필터링: {request.Url?.Host} 차단됨");
+                    OnLogMessage($"[필터링 차단] {request.HttpMethod} {request.Url} - 도메인 '{request.Url?.Host}'이(가) 필터 목록에 없습니다");
                     return;
                 }
+                
+                OnLogMessage($"[필터링 허용] {request.HttpMethod} {request.Url} - 도메인 '{request.Url?.Host}'이(가) 필터를 통과했습니다");
 
                 // CONNECT 메서드 처리 (HTTPS 터널링)
                 if (request.HttpMethod == "CONNECT")
@@ -210,6 +212,7 @@ namespace ClientExternalPC
                 }
 
                 // Relay Server로 전송
+                OnLogMessage($"[요청 전송] {relayMessage.Method} {relayMessage.Url} (SessionId: {sessionId})");
                 await SendMessageAsync(relayMessage);
 
                 // 응답 대기
@@ -222,6 +225,7 @@ namespace ClientExternalPC
                 if (completedTask == timeoutTask)
                 {
                     _pendingRequests.Remove(sessionId);
+                    OnLogMessage($"[타임아웃] {relayMessage.Method} {relayMessage.Url} - 60초 내 응답 없음 (SessionId: {sessionId})");
                     response.StatusCode = 504; // Gateway Timeout
                     response.StatusDescription = "Gateway Timeout";
                     await response.OutputStream.WriteAsync(new byte[0], 0, 0);
@@ -231,6 +235,8 @@ namespace ClientExternalPC
 
                 var relayResponse = await tcs.Task;
                 _pendingRequests.Remove(sessionId);
+
+                OnLogMessage($"[응답 수신] {relayMessage.Method} {relayMessage.Url} - Status: {relayResponse.StatusCode} (SessionId: {sessionId})");
 
                 // 응답 전송
                 response.StatusCode = relayResponse.StatusCode ?? 500;
@@ -273,7 +279,7 @@ namespace ClientExternalPC
             }
             catch (Exception ex)
             {
-                OnLogMessage($"요청 처리 오류: {ex.Message}");
+                OnLogMessage($"[요청 오류] 요청 처리 오류: {ex.Message}");
                 try
                 {
                     response.StatusCode = 500;
@@ -302,12 +308,12 @@ namespace ClientExternalPC
 
                 // 터널링은 복잡하므로, 여기서는 간단히 처리
                 // 실제로는 스트림을 Relay로 전달해야 함
-                OnLogMessage($"CONNECT 요청: {request.RawUrl}");
+                OnLogMessage($"[CONNECT] HTTPS 터널링 요청: {request.RawUrl}");
                 response.Close();
             }
             catch (Exception ex)
             {
-                OnLogMessage($"CONNECT 처리 오류: {ex.Message}");
+                OnLogMessage($"[CONNECT 오류] CONNECT 처리 오류: {ex.Message}");
                 try
                 {
                     response.StatusCode = 502;
@@ -375,7 +381,7 @@ namespace ClientExternalPC
                     else if (result.MessageType == WebSocketMessageType.Close)
                     {
                         OnConnectionStatusChanged(false);
-                        OnLogMessage("WebSocket 연결이 종료되었습니다.");
+                        OnLogMessage("[연결 종료] WebSocket 연결이 종료되었습니다.");
                         break;
                     }
                 }
@@ -387,7 +393,7 @@ namespace ClientExternalPC
                 {
                     if (!cancellationToken.IsCancellationRequested)
                     {
-                        OnLogMessage($"메시지 수신 오류: {ex.Message}");
+                        OnLogMessage($"[WebSocket 오류] 메시지 수신 오류: {ex.Message}");
                         await Task.Delay(1000, cancellationToken);
                     }
                 }
@@ -419,7 +425,7 @@ namespace ClientExternalPC
                 {
                     if (!cancellationToken.IsCancellationRequested)
                     {
-                        OnLogMessage($"PING 전송 오류: {ex.Message}");
+                        OnLogMessage($"[PING 오류] PING 전송 오류: {ex.Message}");
                     }
                 }
             }
@@ -469,7 +475,7 @@ namespace ClientExternalPC
             }
 
             OnConnectionStatusChanged(false);
-            OnLogMessage("프록시 서버가 중지되었습니다.");
+                OnLogMessage("[시스템] 프록시 서버가 중지되었습니다.");
         }
 
         /// <summary>
@@ -560,7 +566,7 @@ namespace ClientExternalPC
             }
             catch (Exception ex)
             {
-                OnLogMessage($"JSON 파싱 오류: {ex.Message}");
+                OnLogMessage($"[JSON 오류] JSON 파싱 오류: {ex.Message}");
                 return new RelayMessage { Type = "ERROR", Error = $"JSON 파싱 실패: {ex.Message}" };
             }
         }
@@ -570,11 +576,18 @@ namespace ClientExternalPC
         /// </summary>
         private bool ShouldProxyRequest(Uri url)
         {
-            if (url == null) return false;
+            if (url == null)
+            {
+                OnLogMessage("[필터링 오류] URL이 null입니다");
+                return false;
+            }
 
             // 필터가 없으면 모든 도메인 허용
             if (_allowedDomains == null || _allowedDomains.Count == 0)
+            {
+                OnLogMessage($"[필터링] 필터가 설정되지 않아 모든 도메인 허용: {url.Host}");
                 return true;
+            }
 
             var host = url.Host;
             
@@ -584,10 +597,12 @@ namespace ClientExternalPC
                 if (host.Equals(allowedDomain, StringComparison.OrdinalIgnoreCase) ||
                     host.EndsWith("." + allowedDomain, StringComparison.OrdinalIgnoreCase))
                 {
+                    OnLogMessage($"[필터링 매칭] '{host}'이(가) 허용된 도메인 '{allowedDomain}'과(와) 매칭되었습니다");
                     return true;
                 }
             }
 
+            OnLogMessage($"[필터링 불일치] '{host}'이(가) 허용된 도메인 목록과 일치하지 않습니다. 허용 목록: {string.Join(", ", _allowedDomains)}");
             return false;
         }
 

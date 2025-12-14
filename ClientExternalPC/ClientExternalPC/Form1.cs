@@ -13,6 +13,7 @@ namespace ClientExternalPC
         private int _proxyPort = 8888;
         private string _domainFilter = ""; // 빈 문자열이면 모든 도메인 허용, 아니면 콤마로 구분된 도메인 목록
         private string _accessToken = "default-token-change-in-production";  // Relay Server에 설정된 토큰
+        private LogForm _logForm;
 
         public Form1()
         {
@@ -20,6 +21,9 @@ namespace ClientExternalPC
             InitializeTrayIcon();
             this.WindowState = FormWindowState.Normal;
             this.ShowInTaskbar = true;
+            
+            // 로그 폼 초기화
+            _logForm = new LogForm();
             
             // 이벤트 핸들러 연결
             this.btnToggle.Click += BtnToggle_Click;
@@ -79,6 +83,22 @@ namespace ClientExternalPC
         private void 설정ToolStripMenuItem_Click(object sender, EventArgs e)
         {
             ShowSettingsForm();
+        }
+
+        private void 로깅ToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            if (_logForm != null && !_logForm.IsDisposed)
+            {
+                if (_logForm.Visible)
+                {
+                    _logForm.Hide();
+                }
+                else
+                {
+                    _logForm.Show();
+                    _logForm.BringToFront();
+                }
+            }
         }
 
         private void 종료ToolStripMenuItem_Click(object sender, EventArgs e)
@@ -147,7 +167,13 @@ namespace ClientExternalPC
                 return;
             }
 
-            // 로그를 리스트박스에 추가하거나 파일에 기록
+            // 로그 폼에 표시
+            if (_logForm != null && !_logForm.IsDisposed)
+            {
+                _logForm.AddLog(message);
+            }
+
+            // 디버그 출력
             System.Diagnostics.Debug.WriteLine(message);
         }
 
@@ -234,6 +260,10 @@ namespace ClientExternalPC
                 if (_isRunning)
                 {
                     StopProxy().Wait(3000);
+                }
+                if (_logForm != null && !_logForm.IsDisposed)
+                {
+                    _logForm.Close();
                 }
             }
             base.OnFormClosing(e);

@@ -13,6 +13,7 @@ namespace ClientExternalPC
         private System.Windows.Forms.ToolStripMenuItem 시작ToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem 중지ToolStripMenuItem;
         private System.Windows.Forms.ToolStripMenuItem 설정ToolStripMenuItem;
+        private System.Windows.Forms.ToolStripMenuItem 로깅ToolStripMenuItem;
         private System.Windows.Forms.ToolStripSeparator toolStripSeparator1;
         private System.Windows.Forms.ToolStripMenuItem 종료ToolStripMenuItem;
         private System.Windows.Forms.Button btnToggle;
@@ -47,6 +48,7 @@ namespace ClientExternalPC
             this.시작ToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.중지ToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.설정ToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
+            this.로깅ToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.toolStripSeparator1 = new System.Windows.Forms.ToolStripSeparator();
             this.종료ToolStripMenuItem = new System.Windows.Forms.ToolStripMenuItem();
             this.btnToggle = new System.Windows.Forms.Button();
@@ -68,10 +70,11 @@ namespace ClientExternalPC
             this.시작ToolStripMenuItem,
             this.중지ToolStripMenuItem,
             this.설정ToolStripMenuItem,
+            this.로깅ToolStripMenuItem,
             this.toolStripSeparator1,
             this.종료ToolStripMenuItem});
             this.contextMenuStrip1.Name = "contextMenuStrip1";
-            this.contextMenuStrip1.Size = new System.Drawing.Size(99, 98);
+            this.contextMenuStrip1.Size = new System.Drawing.Size(99, 120);
             // 
             // 시작ToolStripMenuItem
             // 
@@ -94,6 +97,13 @@ namespace ClientExternalPC
             this.설정ToolStripMenuItem.Size = new System.Drawing.Size(98, 22);
             this.설정ToolStripMenuItem.Text = "설정";
             this.설정ToolStripMenuItem.Click += new System.EventHandler(this.설정ToolStripMenuItem_Click);
+            // 
+            // 로깅ToolStripMenuItem
+            // 
+            this.로깅ToolStripMenuItem.Name = "로깅ToolStripMenuItem";
+            this.로깅ToolStripMenuItem.Size = new System.Drawing.Size(98, 22);
+            this.로깅ToolStripMenuItem.Text = "로깅";
+            this.로깅ToolStripMenuItem.Click += new System.EventHandler(this.로깅ToolStripMenuItem_Click);
             // 
             // toolStripSeparator1
             // 
