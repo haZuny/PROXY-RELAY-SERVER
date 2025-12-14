@@ -352,6 +352,13 @@ namespace ClientInternalPC
                 return;
             }
 
+            // 메시지 유효성 검증
+            if (message == null || string.IsNullOrWhiteSpace(message.Type))
+            {
+                Log("전송할 메시지가 유효하지 않습니다 (Type이 비어있음).");
+                return;
+            }
+
             try
             {
                 var settings = new JsonSerializerSettings
@@ -359,6 +366,14 @@ namespace ClientInternalPC
                     NullValueHandling = NullValueHandling.Ignore
                 };
                 var json = JsonConvert.SerializeObject(message, settings);
+                
+                // 직렬화 결과가 빈 JSON인지 확인
+                if (string.IsNullOrWhiteSpace(json) || json.Trim() == "{}")
+                {
+                    Log($"직렬화된 메시지가 비어있습니다. Type: {message.Type}");
+                    return;
+                }
+                
                 var bytes = Encoding.UTF8.GetBytes(json);
 
                 ClientWebSocket ws;

@@ -69,6 +69,14 @@ public class RelayWebSocketHandler implements WebSocketHandler {
         // 4. 메시지 수신 처리
         return session.receive()
             .map(WebSocketMessage::getPayloadAsText)
+            .filter(messageText -> {
+                // 빈 메시지 필터링
+                if (messageText == null || messageText.trim().isEmpty()) {
+                    logger.debug("Empty message received from session: {}, ignoring", session.getId());
+                    return false;
+                }
+                return true;
+            })
             .flatMap(message -> handleMessage(session, message))
             .then()
             .doFinally(signalType -> {

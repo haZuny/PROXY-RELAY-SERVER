@@ -123,10 +123,17 @@ public class MessageRoutingService {
      * JSON 메시지 파싱
      */
     public RelayMessage parseMessage(String json) {
+        // 빈 메시지 체크
+        if (json == null || json.trim().isEmpty()) {
+            logger.warn("Empty message received, cannot parse");
+            return null;
+        }
+        
         try {
             return objectMapper.readValue(json, RelayMessage.class);
         } catch (Exception e) {
-            logger.error("Error parsing message: {}", json, e);
+            logger.error("Error parsing message (length: {}): {}", json.length(), 
+                json.length() > 100 ? json.substring(0, 100) + "..." : json, e);
             return null;
         }
     }
