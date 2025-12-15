@@ -220,7 +220,22 @@ class RelayWebSocketHandlerTest {
     @Test
     void handle_RequestMessage_RoutesToAgent() throws Exception {
         // Given
-        // Client A를 먼저 연결 (매핑을 위해)
+        // Client B를 먼저 연결 (대기 상태)
+        WebSocketSession mockSessionB = mock(WebSocketSession.class);
+        when(mockSessionB.getId()).thenReturn("session-b-1");
+        when(mockSessionB.isOpen()).thenReturn(true);
+        URI uriB = new URI("ws://localhost:8080/relay?type=B&token=default-token-change-in-production");
+        HandshakeInfo handshakeInfoB = createHandshakeInfo(uriB, new HttpHeaders());
+        when(mockSessionB.getHandshakeInfo()).thenReturn(handshakeInfoB);
+        when(mockSessionB.receive()).thenReturn(Flux.never()); // 연결 유지
+        when(mockSessionB.send(any())).thenReturn(Mono.empty());
+        when(mockSessionB.textMessage(anyString())).thenReturn(mock(WebSocketMessage.class));
+        
+        // Client B 먼저 연결
+        handler.handle(mockSessionB).subscribe();
+        Thread.sleep(100); // 등록 대기
+        
+        // Client A 연결 (이때 Client B와 자동 매핑됨)
         URI uri = new URI("ws://localhost:8080/relay?type=A&token=default-token-change-in-production");
         HandshakeInfo handshakeInfo = createHandshakeInfo(uri, new HttpHeaders());
         when(mockSession.getHandshakeInfo()).thenReturn(handshakeInfo);
@@ -234,18 +249,7 @@ class RelayWebSocketHandlerTest {
         WebSocketMessage wsMessage = mock(WebSocketMessage.class);
         when(wsMessage.getPayloadAsText()).thenReturn(requestJson);
         
-        // Client B 세션 등록
-        WebSocketSession mockSessionB = mock(WebSocketSession.class);
-        when(mockSessionB.getId()).thenReturn("session-b-1");
-        when(mockSessionB.isOpen()).thenReturn(true);
-        URI uriB = new URI("ws://localhost:8080/relay?type=B&token=default-token-change-in-production");
-        HandshakeInfo handshakeInfoB = createHandshakeInfo(uriB, new HttpHeaders());
-        when(mockSessionB.getHandshakeInfo()).thenReturn(handshakeInfoB);
-        when(mockSessionB.receive()).thenReturn(Flux.never()); // 연결 유지
-        when(mockSessionB.send(any())).thenReturn(Mono.empty());
-        when(mockSessionB.textMessage(anyString())).thenReturn(mock(WebSocketMessage.class));
-        
-        // Client A 먼저 연결 (메시지는 200ms 후에 보냄)
+        // Client A 연결 (메시지는 200ms 후에 보냄)
         when(mockSession.receive()).thenReturn(
             Flux.defer(() -> 
                 Mono.delay(java.time.Duration.ofMillis(200))
@@ -257,10 +261,6 @@ class RelayWebSocketHandlerTest {
         when(mockSession.textMessage(anyString())).thenReturn(mock(WebSocketMessage.class));
         
         handler.handle(mockSession).subscribe();
-        Thread.sleep(100); // 등록 대기
-        
-        // Client B 연결 (이때 Client A와 매핑됨)
-        handler.handle(mockSessionB).subscribe();
         Thread.sleep(100); // 매핑 대기
         
         // When - 메시지 처리 대기 (200ms 지연 + 처리 시간)
@@ -268,6 +268,35 @@ class RelayWebSocketHandlerTest {
         
         // Then - Client B로 메시지가 전달되었는지 확인
         verify(mockSessionB, atLeastOnce()).send(any());
+    }
+    
+    /**
+     * 검증: Client A가 연결될 때 Client B가 없으면 연결이 거부되고 에러 메시지를 받아야 함
+     * 목적: Client B가 없는 상황에서 Client A의 연결 거부 및 에러 메시지 전송 확인
+     */
+    @Test
+    void handle_ClientAConnectsWithoutClientB_ConnectionRejectedWithError() throws Exception {
+        // Given
+        // Client B 없이 Client A만 연결 시도
+        URI uri = new URI("ws://localhost:8080/relay?type=A&token=default-token-change-in-production");
+        HandshakeInfo handshakeInfo = createHandshakeInfo(uri, new HttpHeaders());
+        when(mockSession.getHandshakeInfo()).thenReturn(handshakeInfo);
+        
+        when(mockSession.send(any())).thenReturn(Mono.empty());
+        when(mockSession.textMessage(anyString())).thenReturn(mock(WebSocketMessage.class));
+        when(mockSession.close(any())).thenReturn(Mono.empty());
+        
+        // When
+        handler.handle(mockSession).block();
+        
+        // Then - Client A는 등록되지 않아야 함 (연결이 거부되었으므로)
+        assertNull(sessionService.getClientA("test-session-1"), "Client A should not be registered when Client B is unavailable");
+        
+        // 에러 메시지 전송 확인
+        verify(mockSession, atLeastOnce()).send(any());
+        
+        // 연결 종료 확인
+        verify(mockSession, atLeastOnce()).close(any());
     }
     
     /**

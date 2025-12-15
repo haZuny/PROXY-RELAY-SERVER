@@ -103,10 +103,23 @@ namespace ClientExternalPC
 
         private void 종료ToolStripMenuItem_Click(object sender, EventArgs e)
         {
+            // 프록시 중지 및 시스템 프록시 비활성화
             if (_isRunning)
             {
                 StopProxy().Wait(3000);
             }
+            else
+            {
+                // 실행 중이 아니어도 시스템 프록시는 비활성화 (안전장치)
+                SystemProxyHelper.DisableSystemProxy();
+            }
+            
+            // 로그 폼 정리
+            if (_logForm != null && !_logForm.IsDisposed)
+            {
+                _logForm.Close();
+            }
+            
             Application.Exit();
         }
 
@@ -298,16 +311,43 @@ namespace ClientExternalPC
             }
             else
             {
+                // 프로그램 종료 시 프록시 중지 및 시스템 프록시 비활성화
                 if (_isRunning)
                 {
                     StopProxy().Wait(3000);
                 }
+                else
+                {
+                    // 실행 중이 아니어도 시스템 프록시는 비활성화 (안전장치)
+                    SystemProxyHelper.DisableSystemProxy();
+                }
+                
                 if (_logForm != null && !_logForm.IsDisposed)
                 {
                     _logForm.Close();
                 }
             }
             base.OnFormClosing(e);
+        }
+        
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            // 최종 안전장치: 프로그램이 종료될 때 시스템 프록시 비활성화
+            try
+            {
+                if (_isRunning)
+                {
+                    SystemProxyHelper.DisableSystemProxy();
+                }
+                else
+                {
+                    // 실행 중이 아니어도 시스템 프록시는 비활성화
+                    SystemProxyHelper.DisableSystemProxy();
+                }
+            }
+            catch { }
+            
+            base.OnFormClosed(e);
         }
     }
 }

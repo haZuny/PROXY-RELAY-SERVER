@@ -33,27 +33,48 @@ public class MessageRoutingService {
         
         if (clientB == null || !clientB.isActive()) {
             logger.warn("No active Client B found for session: {}", clientASessionId);
-            return sendErrorResponse(clientASessionId, "No active agent available");
+            return sendErrorResponse(clientASessionId, message.getSessionId(), "No active agent available");
         }
         
         try {
+            // 요청 메시지에 sessionId가 없으면 생성 (요청-응답 매칭용)
+            if (message.getSessionId() == null || message.getSessionId().isEmpty()) {
+                message.setSessionId(java.util.UUID.randomUUID().toString());
+            }
+            
             String jsonMessage = objectMapper.writeValueAsString(message);
             WebSocketMessage wsMessage = clientB.getSession().textMessage(jsonMessage);
             
             if (wsMessage == null) {
                 logger.error("Failed to create WebSocket message for Client B {}", clientB.getSession().getId());
-                return sendErrorResponse(clientASessionId, "Failed to create message");
+                return sendErrorResponse(clientASessionId, message.getSessionId(), "Failed to create message");
             }
             
-            logger.info("Routing request from Client A {} to Client B {}", 
-                clientASessionId, clientB.getSession().getId());
+            logger.info("Routing request from Client A {} to Client B {} (sessionId: {}, method: {}, url: {})", 
+                clientASessionId, clientB.getSession().getId(), 
+                message.getSessionId(), message.getMethod(), message.getUrl());
             
             return clientB.getSession().send(Mono.just(wsMessage))
-                .doOnSuccess(v -> logger.debug("Successfully routed message to Client B {}", clientB.getSession().getId()))
-                .doOnError(e -> logger.error("Error sending message to Client B {}", clientB.getSession().getId(), e));
+                .doOnSuccess(v -> logger.debug("Successfully routed request to Client B {} (sessionId: {})", 
+                    clientB.getSession().getId(), message.getSessionId()))
+                .doOnError(e -> {
+                    logger.error("Error sending message to Client B {} (sessionId: {})", 
+                        clientB.getSession().getId(), message.getSessionId(), e);
+                    // 전송 실패 시 에러 응답 전송
+                    sendErrorResponse(clientASessionId, message.getSessionId(), 
+                        "Failed to send request to agent: " + e.getMessage()).subscribe();
+                })
+                .doOnCancel(() -> {
+                    logger.warn("Request routing cancelled for Client A {} (sessionId: {})", 
+                        clientASessionId, message.getSessionId());
+                    sendErrorResponse(clientASessionId, message.getSessionId(), 
+                        "Request cancelled").subscribe();
+                });
         } catch (Exception e) {
-            logger.error("Error routing message to Client B", e);
-            return sendErrorResponse(clientASessionId, "Routing error: " + e.getMessage());
+            logger.error("Error routing message to Client B (sessionId: {})", 
+                message.getSessionId(), e);
+            return sendErrorResponse(clientASessionId, message.getSessionId(), 
+                "Routing error: " + e.getMessage());
         }
     }
     
@@ -64,7 +85,8 @@ public class MessageRoutingService {
         SessionInfo clientA = sessionService.getMappedClientA(clientBSessionId);
         
         if (clientA == null || !clientA.isActive()) {
-            logger.warn("No active Client A found for session: {}", clientBSessionId);
+            logger.warn("No active Client A found for session: {} (response sessionId: {})", 
+                clientBSessionId, message.getSessionId());
             return Mono.empty();
         }
         
@@ -73,18 +95,25 @@ public class MessageRoutingService {
             WebSocketMessage wsMessage = clientA.getSession().textMessage(jsonMessage);
             
             if (wsMessage == null) {
-                logger.error("Failed to create WebSocket message for Client A {}", clientA.getSession().getId());
+                logger.error("Failed to create WebSocket message for Client A {} (response sessionId: {})", 
+                    clientA.getSession().getId(), message.getSessionId());
                 return Mono.empty();
             }
             
-            logger.info("Routing response from Client B {} to Client A {}", 
-                clientBSessionId, clientA.getSession().getId());
+            logger.info("Routing response from Client B {} to Client A {} (sessionId: {}, statusCode: {})", 
+                clientBSessionId, clientA.getSession().getId(), 
+                message.getSessionId(), message.getStatusCode());
             
             return clientA.getSession().send(Mono.just(wsMessage))
-                .doOnSuccess(v -> logger.debug("Successfully routed message to Client A {}", clientA.getSession().getId()))
-                .doOnError(e -> logger.error("Error sending message to Client A {}", clientA.getSession().getId(), e));
+                .doOnSuccess(v -> logger.debug("Successfully routed response to Client A {} (sessionId: {})", 
+                    clientA.getSession().getId(), message.getSessionId()))
+                .doOnError(e -> logger.error("Error sending response to Client A {} (sessionId: {})", 
+                    clientA.getSession().getId(), message.getSessionId(), e))
+                .doOnCancel(() -> logger.warn("Response routing cancelled for Client A {} (sessionId: {})", 
+                    clientA.getSession().getId(), message.getSessionId()));
         } catch (Exception e) {
-            logger.error("Error routing message to Client A", e);
+            logger.error("Error routing response to Client A (sessionId: {})", 
+                message.getSessionId(), e);
             return Mono.empty();
         }
     }
@@ -92,15 +121,18 @@ public class MessageRoutingService {
     /**
      * 에러 응답 전송
      */
-    private Mono<Void> sendErrorResponse(String clientASessionId, String errorMessage) {
+    private Mono<Void> sendErrorResponse(String clientASessionId, String requestSessionId, String errorMessage) {
         SessionInfo clientA = sessionService.getClientA(clientASessionId);
         if (clientA == null || !clientA.isActive()) {
+            logger.warn("Cannot send error response: Client A {} is not active (request sessionId: {})", 
+                clientASessionId, requestSessionId);
             return Mono.empty();
         }
         
         try {
             RelayMessage errorResponse = new RelayMessage();
             errorResponse.setType(RelayMessage.MessageType.RESPONSE);
+            errorResponse.setSessionId(requestSessionId); // 원래 요청의 sessionId 포함
             errorResponse.setStatusCode(500);
             errorResponse.setError(errorMessage);
             
@@ -108,13 +140,21 @@ public class MessageRoutingService {
             WebSocketMessage wsMessage = clientA.getSession().textMessage(jsonMessage);
             
             if (wsMessage == null) {
-                logger.error("Failed to create error response message for Client A {}", clientASessionId);
+                logger.error("Failed to create error response message for Client A {} (request sessionId: {})", 
+                    clientASessionId, requestSessionId);
                 return Mono.empty();
             }
             
-            return clientA.getSession().send(Mono.just(wsMessage));
+            logger.info("Sending error response to Client A {} (sessionId: {}, error: {})", 
+                clientASessionId, requestSessionId, errorMessage);
+            
+            return clientA.getSession().send(Mono.just(wsMessage))
+                .doOnSuccess(v -> logger.debug("Error response sent to Client A {} (sessionId: {})", 
+                    clientASessionId, requestSessionId))
+                .doOnError(e -> logger.error("Error sending error response to Client A {} (sessionId: {})", 
+                    clientASessionId, requestSessionId, e));
         } catch (Exception e) {
-            logger.error("Error sending error response", e);
+            logger.error("Error creating error response (sessionId: {})", requestSessionId, e);
             return Mono.empty();
         }
     }

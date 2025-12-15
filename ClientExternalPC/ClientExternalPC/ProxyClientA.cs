@@ -354,11 +354,19 @@ namespace ClientExternalPC
                     }
 
                     OnLogMessage($"[응답 수신] {relayMessage.Method} {relayMessage.Url} - Status: {relayResponse.StatusCode} (SessionId: {sessionId})");
+                    if (!string.IsNullOrEmpty(relayResponse.Error))
+                    {
+                        OnLogMessage($"[응답 오류 메시지] {relayResponse.Error}");
+                    }
 
                     // 응답 전송
-                    response.StatusCode = relayResponse.StatusCode ?? 500;
-                    response.StatusDescription = GetStatusDescription(relayResponse.StatusCode ?? 500);
+                    var statusCode = relayResponse.StatusCode ?? 500;
+                    response.StatusCode = statusCode;
+                    response.StatusDescription = GetStatusDescription(statusCode);
 
+                    // 기본 Content-Type 설정 (헤더에 없을 경우)
+                    string contentType = null;
+                    
                     if (relayResponse.Headers != null)
                     {
                         foreach (var header in relayResponse.Headers)
@@ -367,32 +375,73 @@ namespace ClientExternalPC
                             {
                                 if (header.Key.Equals("Content-Type", StringComparison.OrdinalIgnoreCase))
                                 {
+                                    contentType = header.Value;
                                     response.ContentType = header.Value;
                                 }
                                 else if (header.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
                                 {
                                     // Content-Length는 자동 설정됨
                                 }
-                                else if (!header.Key.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase))
+                                else if (!header.Key.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase) &&
+                                         !header.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase))
                                 {
                                     response.Headers[header.Key] = header.Value;
                                 }
                             }
-                            catch
+                            catch (Exception ex)
                             {
-                                // 일부 헤더는 설정할 수 없음 (무시)
+                                OnLogMessage($"[헤더 설정 실패] {header.Key}: {ex.Message}");
                             }
                         }
                     }
 
+                    // 응답 본문 처리
+                    byte[] bodyBytes = null;
                     if (!string.IsNullOrEmpty(relayResponse.Body))
                     {
-                        var bodyBytes = Encoding.UTF8.GetBytes(relayResponse.Body);
-                        response.ContentLength64 = bodyBytes.Length;
-                        await response.OutputStream.WriteAsync(bodyBytes, 0, bodyBytes.Length);
+                        bodyBytes = Encoding.UTF8.GetBytes(relayResponse.Body);
+                    }
+                    else
+                    {
+                        bodyBytes = new byte[0];
                     }
 
+                    // Content-Type이 없으면 기본값 설정
+                    if (string.IsNullOrEmpty(contentType))
+                    {
+                        if (bodyBytes.Length > 0)
+                        {
+                            response.ContentType = "text/html; charset=utf-8";
+                        }
+                        else
+                        {
+                            response.ContentType = "text/plain; charset=utf-8";
+                        }
+                    }
+
+                    response.ContentLength64 = bodyBytes.Length;
+                    
+                    // 5xx 에러 시 브라우저 재시도 방지 헤더 추가
+                    if (statusCode >= 500)
+                    {
+                        try
+                        {
+                            response.Headers.Add("Cache-Control", "no-cache, no-store, must-revalidate");
+                            response.Headers.Add("Pragma", "no-cache");
+                            response.Headers.Add("Expires", "0");
+                        }
+                        catch { }
+                    }
+                    
+                    // 응답 본문 전송
+                    if (bodyBytes.Length > 0)
+                    {
+                        await response.OutputStream.WriteAsync(bodyBytes, 0, bodyBytes.Length);
+                    }
+                    await response.OutputStream.FlushAsync();
+
                     response.Close();
+                    OnLogMessage($"[응답 전송 완료] {relayMessage.Method} {relayMessage.Url} - Status: {statusCode}, Body: {bodyBytes.Length} bytes, Content-Type: {response.ContentType} (SessionId: {sessionId})");
                 }
                 catch (Exception ex)
                 {

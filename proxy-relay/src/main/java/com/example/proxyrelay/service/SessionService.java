@@ -98,11 +98,17 @@ public class SessionService {
     }
     
     /**
-     * 사용 가능한 Client B 세션 찾기 (첫 번째 활성 세션 반환)
+     * 사용 가능한 Client B 세션 찾기 (매핑되지 않은 첫 번째 활성 세션 반환)
      */
     public SessionInfo findAvailableClientB() {
         return clientBSessions.values().stream()
             .filter(SessionInfo::isActive)
+            .filter(session -> {
+                // 이미 매핑된 Client B인지 확인
+                String sessionId = session.getSession().getId();
+                return sessionMapping.values().stream()
+                    .noneMatch(mappedBId -> mappedBId.equals(sessionId));
+            })
             .findFirst()
             .orElse(null);
     }
