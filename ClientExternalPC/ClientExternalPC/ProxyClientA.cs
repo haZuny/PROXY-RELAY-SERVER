@@ -186,12 +186,13 @@ namespace ClientExternalPC
         {
             var request = context.Request;
             var response = context.Response;
+            var requestId = $"{request.RemoteEndPoint}_{DateTime.Now:HHmmss.fff}"; // 요청 추적용 ID
 
             try
             {
                 // 모든 요청에 대해 로그 기록 (요청이 들어오는지 확인)
-                OnLogMessage($"[요청 수신] {request.HttpMethod} {request.Url} - 도메인: {request.Url?.Host ?? "null"}");
-                OnLogMessage($"[요청 상세] User-Agent: {request.UserAgent ?? "없음"}, RemoteEndPoint: {request.RemoteEndPoint}");
+                OnLogMessage($"[요청 수신] [{requestId}] {request.HttpMethod} {request.Url} - 도메인: {request.Url?.Host ?? "null"}");
+                OnLogMessage($"[요청 상세] [{requestId}] User-Agent: {request.UserAgent ?? "없음"}, RemoteEndPoint: {request.RemoteEndPoint}");
 
                 // CONNECT 메서드 처리 (HTTPS 터널링) - 필터링 체크 전에 처리
                 if (request.HttpMethod == "CONNECT")
@@ -236,6 +237,7 @@ namespace ClientExternalPC
 
                 // 일반 HTTP 요청 처리 (Relay Server 경유)
                 var sessionId = Guid.NewGuid().ToString();
+                OnLogMessage($"[SessionId 생성] [{requestId}] SessionId: {sessionId} - 요청과 연결됨");
                 var relayMessage = new RelayMessage
                 {
                     Type = "REQUEST",
@@ -276,13 +278,13 @@ namespace ClientExternalPC
                 }
 
                 // Relay Server로 전송
-                OnLogMessage($"[요청 전송] {relayMessage.Method} {relayMessage.Url} (SessionId: {sessionId})");
-                OnLogMessage($"[WebSocket 상태] WebSocket 연결 상태: {_webSocket?.State}");
+                OnLogMessage($"[요청 전송] [{requestId}] {relayMessage.Method} {relayMessage.Url} (SessionId: {sessionId})");
+                OnLogMessage($"[WebSocket 상태] [{requestId}] WebSocket 연결 상태: {_webSocket?.State}");
                 
                 try
                 {
                     await SendMessageAsync(relayMessage);
-                    OnLogMessage($"[요청 전송 성공] Relay Server로 요청 전송 완료 (SessionId: {sessionId})");
+                    OnLogMessage($"[요청 전송 성공] [{requestId}] Relay Server로 요청 전송 완료 (SessionId: {sessionId})");
                 }
                 catch (Exception ex)
                 {
@@ -301,7 +303,11 @@ namespace ClientExternalPC
 
                 // 응답 대기
                 var tcs = new TaskCompletionSource<RelayMessage>();
-                _pendingRequests[sessionId] = tcs;
+                lock (_pendingRequests)
+                {
+                    _pendingRequests[sessionId] = tcs;
+                    OnLogMessage($"[응답 대기 시작] [{requestId}] SessionId: {sessionId} - _pendingRequests에 등록됨 (총 {_pendingRequests.Count}개 대기 중)");
+                }
 
                 try
                 {
@@ -310,16 +316,48 @@ namespace ClientExternalPC
 
                     if (completedTask == timeoutTask)
                     {
-                        if (_pendingRequests.ContainsKey(sessionId))
+                        // 타임아웃 시 TaskCompletionSource를 완료시켜서 무한 대기 방지
+                        TaskCompletionSource<RelayMessage> timeoutTcs = null;
+                        lock (_pendingRequests)
                         {
-                            _pendingRequests.Remove(sessionId);
+                            if (_pendingRequests.ContainsKey(sessionId))
+                            {
+                                timeoutTcs = _pendingRequests[sessionId];
+                                _pendingRequests.Remove(sessionId);
+                            }
                         }
+                        
+                        if (timeoutTcs != null)
+                        {
+                            // 타임아웃 응답 생성
+                            var timeoutResponse = new RelayMessage
+                            {
+                                Type = "RESPONSE",
+                                SessionId = sessionId,
+                                StatusCode = 504,
+                                Error = "Gateway Timeout - 60초 내 응답 없음"
+                            };
+                            
+                            // TaskCompletionSource를 완료시켜서 무한 대기 방지
+                            try
+                            {
+                                timeoutTcs.TrySetResult(timeoutResponse);
+                            }
+                            catch { }
+                        }
+                        
                         OnLogMessage($"[타임아웃] {relayMessage.Method} {relayMessage.Url} - 60초 내 응답 없음 (SessionId: {sessionId})");
                         response.StatusCode = 504; // Gateway Timeout
                         response.StatusDescription = "Gateway Timeout";
+                        response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+                        response.Headers.Set("Pragma", "no-cache");
+                        response.Headers.Set("Expires", "0");
+                        response.Headers.Set("Retry-After", "3600");
+                        response.Headers.Set("Connection", "close");
+                        response.ContentLength64 = 0;
                         try
                         {
-                            await response.OutputStream.WriteAsync(new byte[0], 0, 0);
+                            await response.OutputStream.FlushAsync();
                         }
                         catch { }
                         response.Close();
@@ -329,10 +367,27 @@ namespace ClientExternalPC
                     RelayMessage relayResponse;
                     try
                     {
+                        OnLogMessage($"[응답 대기 중] [{requestId}] SessionId: {sessionId} - 응답 수신 대기 중...");
                         relayResponse = await tcs.Task;
+                        OnLogMessage($"[응답 수신 완료] [{requestId}] SessionId: {sessionId} - 응답을 받았습니다! StatusCode: {relayResponse.StatusCode}");
+                        
+                        // 응답을 받았으므로 _pendingRequests에서 제거 (이미 ReceiveMessagesAsync에서 제거되었을 수 있음)
+                        lock (_pendingRequests)
+                        {
+                            if (_pendingRequests.ContainsKey(sessionId))
+                            {
+                                _pendingRequests.Remove(sessionId);
+                                OnLogMessage($"[응답 처리] [{requestId}] SessionId: {sessionId} - _pendingRequests에서 제거됨");
+                            }
+                            else
+                            {
+                                OnLogMessage($"[응답 처리] [{requestId}] SessionId: {sessionId} - _pendingRequests에 없음 (이미 제거됨)");
+                            }
+                        }
                     }
                     catch (Exception ex)
                     {
+                        // 예외 발생 시에도 _pendingRequests에서 제거
                         if (_pendingRequests.ContainsKey(sessionId))
                         {
                             _pendingRequests.Remove(sessionId);
@@ -344,22 +399,24 @@ namespace ClientExternalPC
                         }
                         response.StatusCode = 502;
                         response.StatusDescription = "Bad Gateway - Error receiving response";
+                        response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+                        response.Headers.Set("Pragma", "no-cache");
+                        response.Headers.Set("Expires", "0");
+                        response.Headers.Set("Retry-After", "3600");
+                        response.Headers.Set("Connection", "close");
+                        response.ContentLength64 = 0;
                         response.Close();
                         return;
                     }
 
-                    if (_pendingRequests.ContainsKey(sessionId))
-                    {
-                        _pendingRequests.Remove(sessionId);
-                    }
-
-                    OnLogMessage($"[응답 수신] {relayMessage.Method} {relayMessage.Url} - Status: {relayResponse.StatusCode} (SessionId: {sessionId})");
+                    OnLogMessage($"[응답 수신] [{requestId}] {relayMessage.Method} {relayMessage.Url} - Status: {relayResponse.StatusCode} (SessionId: {sessionId})");
                     if (!string.IsNullOrEmpty(relayResponse.Error))
                     {
-                        OnLogMessage($"[응답 오류 메시지] {relayResponse.Error}");
+                        OnLogMessage($"[응답 오류 메시지] [{requestId}] {relayResponse.Error}");
                     }
 
-                    // 응답 전송
+                    // 응답 전송 (브라우저에 전달)
+                    OnLogMessage($"[응답 전송 시작] [{requestId}] SessionId: {sessionId} - 브라우저({request.RemoteEndPoint})에 응답 전송 시작");
                     var statusCode = relayResponse.StatusCode ?? 500;
                     response.StatusCode = statusCode;
                     response.StatusDescription = GetStatusDescription(statusCode);
@@ -403,7 +460,17 @@ namespace ClientExternalPC
                     }
                     else
                     {
-                        bodyBytes = new byte[0];
+                        // 5xx 에러이고 본문이 없으면 에러 메시지를 본문으로 포함
+                        if (statusCode >= 500 && !string.IsNullOrEmpty(relayResponse.Error))
+                        {
+                            var errorBody = $"Internal Server Error: {relayResponse.Error}";
+                            bodyBytes = Encoding.UTF8.GetBytes(errorBody);
+                            OnLogMessage($"[5xx 에러 본문] 에러 메시지를 본문에 포함: {relayResponse.Error}");
+                        }
+                        else
+                        {
+                            bodyBytes = new byte[0];
+                        }
                     }
 
                     // Content-Type이 없으면 기본값 설정
@@ -426,26 +493,78 @@ namespace ClientExternalPC
                     {
                         try
                         {
-                            response.Headers.Add("Cache-Control", "no-cache, no-store, must-revalidate");
-                            response.Headers.Add("Pragma", "no-cache");
-                            response.Headers.Add("Expires", "0");
+                            // 브라우저 재시도 방지를 위한 강력한 헤더 설정
+                            response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+                            response.Headers.Set("Pragma", "no-cache");
+                            response.Headers.Set("Expires", "0");
+                            // Retry-After 헤더 추가 (브라우저에게 재시도하지 말라고 명시)
+                            response.Headers.Set("Retry-After", "3600"); // 1시간 후 재시도 (실제로는 재시도 안 함)
+                            // Connection: close로 연결 종료
+                            response.Headers.Set("Connection", "close");
+                            // X-Error-Message 헤더 추가 (디버깅용)
+                            if (!string.IsNullOrEmpty(relayResponse.Error))
+                            {
+                                try
+                                {
+                                    response.Headers.Set("X-Error-Message", relayResponse.Error);
+                                }
+                                catch { }
+                            }
                         }
-                        catch { }
+                        catch (Exception ex)
+                        {
+                            OnLogMessage($"[헤더 설정 실패] 5xx 에러 헤더 설정 실패: {ex.Message}");
+                        }
                     }
                     
                     // 응답 본문 전송
-                    if (bodyBytes.Length > 0)
+                    try
                     {
-                        await response.OutputStream.WriteAsync(bodyBytes, 0, bodyBytes.Length);
+                        if (bodyBytes.Length > 0)
+                        {
+                            await response.OutputStream.WriteAsync(bodyBytes, 0, bodyBytes.Length);
+                            OnLogMessage($"[응답 본문 전송] {bodyBytes.Length} bytes 전송 완료");
+                        }
+                        else
+                        {
+                            // 본문이 없어도 최소한의 에러 메시지 포함 (5xx 에러인 경우)
+                            if (statusCode >= 500)
+                            {
+                                var errorMsg = $"HTTP {statusCode} Error";
+                                if (!string.IsNullOrEmpty(relayResponse.Error))
+                                {
+                                    errorMsg = $"HTTP {statusCode} Error: {relayResponse.Error}";
+                                }
+                                var errorBytes = Encoding.UTF8.GetBytes(errorMsg);
+                                response.ContentLength64 = errorBytes.Length;
+                                await response.OutputStream.WriteAsync(errorBytes, 0, errorBytes.Length);
+                                OnLogMessage($"[5xx 에러 본문 추가] {errorBytes.Length} bytes 에러 메시지 전송");
+                            }
+                        }
+                        
+                        // 응답 스트림 플러시 및 닫기
+                        await response.OutputStream.FlushAsync();
+                        OnLogMessage($"[응답 플러시 완료] Status: {statusCode}");
+                        
+                        // 응답 닫기 (이것이 실제로 브라우저에 응답을 전송함)
+                        response.Close();
+                        OnLogMessage($"[응답 전송 완료] [{requestId}] {relayMessage.Method} {relayMessage.Url} - Status: {statusCode}, Body: {response.ContentLength64} bytes, Content-Type: {response.ContentType} (SessionId: {sessionId})");
+                        OnLogMessage($"[응답 전송 완료] [{requestId}] 브라우저({request.RemoteEndPoint})에 응답이 전송되었습니다!");
                     }
-                    await response.OutputStream.FlushAsync();
-
-                    response.Close();
-                    OnLogMessage($"[응답 전송 완료] {relayMessage.Method} {relayMessage.Url} - Status: {statusCode}, Body: {bodyBytes.Length} bytes, Content-Type: {response.ContentType} (SessionId: {sessionId})");
+                    catch (Exception ex)
+                    {
+                        OnLogMessage($"[응답 전송 오류] 응답 전송 중 오류 발생: {ex.Message}");
+                        try
+                        {
+                            response.Abort(); // 응답 중단
+                        }
+                        catch { }
+                    }
                 }
                 catch (Exception ex)
                 {
-                    if (_pendingRequests.ContainsKey(sessionId))
+                    // 예외 발생 시에도 _pendingRequests에서 제거
+                    lock (_pendingRequests)
                     {
                         _pendingRequests.Remove(sessionId);
                     }
@@ -454,6 +573,12 @@ namespace ClientExternalPC
                     {
                         response.StatusCode = 502;
                         response.StatusDescription = "Bad Gateway - Error processing response";
+                        response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+                        response.Headers.Set("Pragma", "no-cache");
+                        response.Headers.Set("Expires", "0");
+                        response.Headers.Set("Retry-After", "3600");
+                        response.Headers.Set("Connection", "close");
+                        response.ContentLength64 = 0;
                         response.Close();
                     }
                     catch { }
@@ -466,6 +591,12 @@ namespace ClientExternalPC
                 {
                     response.StatusCode = 500;
                     response.StatusDescription = "Internal Server Error";
+                    response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+                    response.Headers.Set("Pragma", "no-cache");
+                    response.Headers.Set("Expires", "0");
+                    response.Headers.Set("Retry-After", "3600");
+                    response.Headers.Set("Connection", "close");
+                    response.ContentLength64 = 0;
                     response.Close();
                 }
                 catch { }
@@ -794,7 +925,10 @@ namespace ClientExternalPC
 
                 // 응답 대기
                 var tcs = new TaskCompletionSource<RelayMessage>();
-                _pendingRequests[sessionId] = tcs;
+                lock (_pendingRequests)
+                {
+                    _pendingRequests[sessionId] = tcs;
+                }
 
                 try
                 {
@@ -803,13 +937,45 @@ namespace ClientExternalPC
 
                     if (completedTask == timeoutTask)
                     {
-                        if (_pendingRequests.ContainsKey(sessionId))
+                        // 타임아웃 시 TaskCompletionSource를 완료시켜서 무한 대기 방지
+                        TaskCompletionSource<RelayMessage> timeoutTcs = null;
+                        lock (_pendingRequests)
                         {
-                            _pendingRequests.Remove(sessionId);
+                            if (_pendingRequests.ContainsKey(sessionId))
+                            {
+                                timeoutTcs = _pendingRequests[sessionId];
+                                _pendingRequests.Remove(sessionId);
+                            }
                         }
+                        
+                        if (timeoutTcs != null)
+                        {
+                            // 타임아웃 응답 생성
+                            var timeoutResponse = new RelayMessage
+                            {
+                                Type = "RESPONSE",
+                                SessionId = sessionId,
+                                StatusCode = 504,
+                                Error = "Gateway Timeout - 10초 내 응답 없음"
+                            };
+                            
+                            // TaskCompletionSource를 완료시켜서 무한 대기 방지
+                            try
+                            {
+                                timeoutTcs.TrySetResult(timeoutResponse);
+                            }
+                            catch { }
+                        }
+                        
                         OnLogMessage($"[CONNECT 타임아웃] CONNECT 요청 타임아웃: {targetHost}");
                         response.StatusCode = 504;
                         response.StatusDescription = "Gateway Timeout";
+                        response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+                        response.Headers.Set("Pragma", "no-cache");
+                        response.Headers.Set("Expires", "0");
+                        response.Headers.Set("Retry-After", "3600");
+                        response.Headers.Set("Connection", "close");
+                        response.ContentLength64 = 0;
                         response.Close();
                         return;
                     }
@@ -818,23 +984,31 @@ namespace ClientExternalPC
                     try
                     {
                         relayResponse = await tcs.Task;
+                        
+                        // 응답을 받았으므로 _pendingRequests에서 제거
+                        lock (_pendingRequests)
+                        {
+                            _pendingRequests.Remove(sessionId);
+                        }
                     }
                     catch (Exception ex)
                     {
-                        if (_pendingRequests.ContainsKey(sessionId))
+                        // 예외 발생 시에도 _pendingRequests에서 제거
+                        lock (_pendingRequests)
                         {
                             _pendingRequests.Remove(sessionId);
                         }
                         OnLogMessage($"[CONNECT 응답 수신 오류] 응답 수신 중 오류 발생: {ex.Message}");
                         response.StatusCode = 502;
                         response.StatusDescription = "Bad Gateway - Error receiving CONNECT response";
+                        response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+                        response.Headers.Set("Pragma", "no-cache");
+                        response.Headers.Set("Expires", "0");
+                        response.Headers.Set("Retry-After", "3600");
+                        response.Headers.Set("Connection", "close");
+                        response.ContentLength64 = 0;
                         response.Close();
                         return;
-                    }
-
-                    if (_pendingRequests.ContainsKey(sessionId))
-                    {
-                        _pendingRequests.Remove(sessionId);
                     }
 
                     if (relayResponse.StatusCode == 200)
@@ -851,14 +1025,31 @@ namespace ClientExternalPC
                     else
                     {
                         OnLogMessage($"[CONNECT 실패] Relay Server 응답: {relayResponse.StatusCode}");
-                        response.StatusCode = relayResponse.StatusCode ?? 502;
+                        var errorStatusCode = relayResponse.StatusCode ?? 502;
+                        response.StatusCode = errorStatusCode;
                         response.StatusDescription = relayResponse.Error ?? "Bad Gateway";
+                        
+                        // 5xx 에러 시 브라우저 재시도 방지
+                        if (errorStatusCode >= 500)
+                        {
+                            try
+                            {
+                                response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+                                response.Headers.Set("Pragma", "no-cache");
+                                response.Headers.Set("Expires", "0");
+                                response.Headers.Set("Retry-After", "3600");
+                                response.Headers.Set("Connection", "close");
+                            }
+                            catch { }
+                        }
+                        response.ContentLength64 = 0;
                         response.Close();
                     }
                 }
                 catch (Exception ex)
                 {
-                    if (_pendingRequests.ContainsKey(sessionId))
+                    // 예외 발생 시에도 _pendingRequests에서 제거
+                    lock (_pendingRequests)
                     {
                         _pendingRequests.Remove(sessionId);
                     }
@@ -867,6 +1058,12 @@ namespace ClientExternalPC
                     {
                         response.StatusCode = 502;
                         response.StatusDescription = "Bad Gateway - Error processing CONNECT response";
+                        response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+                        response.Headers.Set("Pragma", "no-cache");
+                        response.Headers.Set("Expires", "0");
+                        response.Headers.Set("Retry-After", "3600");
+                        response.Headers.Set("Connection", "close");
+                        response.ContentLength64 = 0;
                         response.Close();
                     }
                     catch { }
@@ -878,6 +1075,13 @@ namespace ClientExternalPC
                 try
                 {
                     response.StatusCode = 502;
+                    response.StatusDescription = "Bad Gateway";
+                    response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+                    response.Headers.Set("Pragma", "no-cache");
+                    response.Headers.Set("Expires", "0");
+                    response.Headers.Set("Retry-After", "3600");
+                    response.Headers.Set("Connection", "close");
+                    response.ContentLength64 = 0;
                     response.Close();
                 }
                 catch { }
@@ -925,32 +1129,78 @@ namespace ClientExternalPC
         private async Task ReceiveMessagesAsync(CancellationToken cancellationToken)
         {
             var buffer = new byte[4096];
+            OnLogMessage("[WebSocket 수신 루프 시작] ReceiveMessagesAsync 시작됨");
 
-            while (!cancellationToken.IsCancellationRequested && _webSocket?.State == WebSocketState.Open)
+            while (!cancellationToken.IsCancellationRequested)
             {
                 try
                 {
+                    // WebSocket 상태 확인
+                    if (_webSocket == null || _webSocket.State != WebSocketState.Open)
+                    {
+                        OnLogMessage($"[WebSocket 종료] WebSocket이 열려있지 않습니다. 상태: {_webSocket?.State ?? WebSocketState.None}");
+                        break;
+                    }
+
+                    OnLogMessage($"[WebSocket 수신 대기] 메시지 수신 대기 중... (상태: {_webSocket.State})");
                     var result = await _webSocket.ReceiveAsync(
                         new ArraySegment<byte>(buffer),
                         cancellationToken
                     );
+                    OnLogMessage($"[WebSocket 메시지 수신] MessageType: {result.MessageType}, Count: {result.Count}, EndOfMessage: {result.EndOfMessage}");
 
                     if (result.MessageType == WebSocketMessageType.Text)
                     {
                         var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                        OnLogMessage($"[WebSocket JSON 수신] JSON 길이: {json.Length}, 내용 (처음 200자): {json.Substring(0, Math.Min(200, json.Length))}");
                         var message = DeserializeMessage(json);
+                        OnLogMessage($"[WebSocket 메시지 파싱 완료] Type: {message.Type}, SessionId: {message.SessionId ?? "null"}, StatusCode: {message.StatusCode}");
 
                         if (message.Type == "RESPONSE")
                         {
                             // 응답을 대기 중인 요청에 전달
-                            if (!string.IsNullOrEmpty(message.SessionId) && _pendingRequests.ContainsKey(message.SessionId))
+                            TaskCompletionSource<RelayMessage> tcs = null;
+                            lock (_pendingRequests)
                             {
-                                _pendingRequests[message.SessionId].SetResult(message);
+                                OnLogMessage($"[WebSocket 응답 수신] SessionId: {message.SessionId}, StatusCode: {message.StatusCode} - _pendingRequests에서 찾는 중 (총 {_pendingRequests.Count}개 대기 중)");
+                                if (!string.IsNullOrEmpty(message.SessionId) && _pendingRequests.ContainsKey(message.SessionId))
+                                {
+                                    tcs = _pendingRequests[message.SessionId];
+                                    _pendingRequests.Remove(message.SessionId);
+                                    OnLogMessage($"[WebSocket 응답 매칭] SessionId: {message.SessionId} - _pendingRequests에서 찾아서 제거함 (남은 대기: {_pendingRequests.Count}개)");
+                                }
+                                else
+                                {
+                                    OnLogMessage($"[WebSocket 응답 매칭 실패] SessionId: {message.SessionId} - _pendingRequests에 없음. 대기 중인 SessionId 목록: {string.Join(", ", _pendingRequests.Keys.Take(5))}");
+                                }
+                            }
+                            
+                            if (tcs != null)
+                            {
+                                // TaskCompletionSource를 완료시켜서 대기 중인 요청에 응답 전달
+                                try
+                                {
+                                    tcs.TrySetResult(message);
+                                    OnLogMessage($"[응답 매칭 성공] SessionId: {message.SessionId}, StatusCode: {message.StatusCode} - 대기 중인 요청에 응답 전달됨");
+                                }
+                                catch (Exception ex)
+                                {
+                                    OnLogMessage($"[응답 매칭 실패] SessionId: {message.SessionId}, 오류: {ex.Message}");
+                                }
+                            }
+                            else
+                            {
+                                OnLogMessage($"[응답 매칭 실패] SessionId '{message.SessionId}'에 대한 대기 중인 요청이 없습니다. (이미 타임아웃되었거나 처리되었을 수 있음)");
                             }
                         }
                         else if (message.Type == "PONG")
                         {
                             // PONG 수신 (연결 유지 확인)
+                            OnLogMessage("[PONG 수신] 연결 유지 확인");
+                        }
+                        else
+                        {
+                            OnLogMessage($"[알 수 없는 메시지 타입] Type: {message.Type}");
                         }
                     }
                     else if (result.MessageType == WebSocketMessageType.Close)
@@ -962,17 +1212,42 @@ namespace ClientExternalPC
                 }
                 catch (OperationCanceledException)
                 {
+                    OnLogMessage("[WebSocket 종료] 취소 요청됨");
                     break;
+                }
+                catch (WebSocketException ex)
+                {
+                    OnLogMessage($"[WebSocket 예외] WebSocket 예외 발생: {ex.Message}, 상태: {_webSocket?.State ?? WebSocketState.None}");
+                    if (_webSocket?.State != WebSocketState.Open)
+                    {
+                        OnConnectionStatusChanged(false);
+                        break;
+                    }
+                    if (!cancellationToken.IsCancellationRequested)
+                    {
+                        await Task.Delay(1000, cancellationToken);
+                    }
                 }
                 catch (Exception ex)
                 {
                     if (!cancellationToken.IsCancellationRequested)
                     {
                         OnLogMessage($"[WebSocket 오류] 메시지 수신 오류: {ex.Message}");
+                        if (_webSocket?.State != WebSocketState.Open)
+                        {
+                            OnConnectionStatusChanged(false);
+                            break;
+                        }
                         await Task.Delay(1000, cancellationToken);
+                    }
+                    else
+                    {
+                        break;
                     }
                 }
             }
+            
+            OnLogMessage("[WebSocket 수신 루프 종료] ReceiveMessagesAsync 종료");
         }
 
         /// <summary>
@@ -1017,6 +1292,28 @@ namespace ClientExternalPC
             _isRunning = false;
             _cancellationTokenSource?.Cancel();
 
+            // 모든 대기 중인 요청 취소
+            lock (_pendingRequests)
+            {
+                foreach (var kvp in _pendingRequests)
+                {
+                    try
+                    {
+                        // 타임아웃 응답으로 완료시켜서 무한 대기 방지
+                        var cancelResponse = new RelayMessage
+                        {
+                            Type = "RESPONSE",
+                            SessionId = kvp.Key,
+                            StatusCode = 503,
+                            Error = "Service Unavailable - Proxy server is shutting down"
+                        };
+                        kvp.Value.TrySetResult(cancelResponse);
+                    }
+                    catch { }
+                }
+                _pendingRequests.Clear();
+            }
+
             try
             {
                 _httpListener?.Stop();
@@ -1050,7 +1347,7 @@ namespace ClientExternalPC
             }
 
             OnConnectionStatusChanged(false);
-                OnLogMessage("[시스템] 프록시 서버가 중지되었습니다.");
+            OnLogMessage("[시스템] 프록시 서버가 중지되었습니다.");
         }
 
         /// <summary>
