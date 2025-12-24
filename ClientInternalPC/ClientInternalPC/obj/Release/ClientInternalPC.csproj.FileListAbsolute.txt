@@ -1,0 +1,12 @@
+F:\proxyprog\ClientInternalPC\ClientInternalPC\bin\Release\ClientInternalPC.exe.config
+F:\proxyprog\ClientInternalPC\ClientInternalPC\bin\Release\ClientInternalPC.exe
+F:\proxyprog\ClientInternalPC\ClientInternalPC\bin\Release\ClientInternalPC.pdb
+F:\proxyprog\ClientInternalPC\ClientInternalPC\bin\Release\Newtonsoft.Json.dll
+F:\proxyprog\ClientInternalPC\ClientInternalPC\bin\Release\Newtonsoft.Json.xml
+F:\proxyprog\ClientInternalPC\ClientInternalPC\obj\Release\ClientInternalPC.csproj.AssemblyReference.cache
+F:\proxyprog\ClientInternalPC\ClientInternalPC\obj\Release\ClientInternalPC.Properties.Resources.resources
+F:\proxyprog\ClientInternalPC\ClientInternalPC\obj\Release\ClientInternalPC.csproj.GenerateResource.cache
+F:\proxyprog\ClientInternalPC\ClientInternalPC\obj\Release\ClientInternalPC.csproj.CoreCompileInputs.cache
+F:\proxyprog\ClientInternalPC\ClientInternalPC\obj\Release\ClientInternalPC.csproj.CopyComplete
+F:\proxyprog\ClientInternalPC\ClientInternalPC\obj\Release\ClientInternalPC.exe
+F:\proxyprog\ClientInternalPC\ClientInternalPC\obj\Release\ClientInternalPC.pdb

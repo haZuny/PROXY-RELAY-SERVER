@@ -1,0 +1,153 @@
+================================================================================
+HTTPS 터널링(CONNECT) 처리 수정 요약
+================================================================================
+
+[문제 상황]
+-----------
+curl이나 브라우저에서 HTTPS 사이트에 접속할 때 다음과 같은 오류 발생:
+  - HTTP/1.1 400 Bad Request
+  - CONNECT tunnel failed, response 400
+
+HTTPS 요청이 프록시를 통해 전달되지 않음.
+
+
+[원인 분석]
+-----------
+1. HttpListener의 제한사항
+   - HttpListener는 HTTP 요청(GET, POST 등)만 처리 가능
+   - CONNECT 메서드는 HTTP 프로토콜이 아닌 TCP 레벨 터널링이 필요
+   - HttpListener가 CONNECT 요청을 받으면 자동으로 400 Bad Request 반환
+
+2. 기존 코드의 문제점
+   - HttpListener만 사용하여 프록시 서버 구현
+   - CONNECT 요청을 감지하고 HandleConnectRequestAsync로 라우팅했지만,
+     HttpListener가 이미 400 에러를 반환한 후였음
+   - Relay Server를 통한 터널링 시도했지만, Relay Server는 JSON 메시지만 처리하여
+     바이너리 스트리밍 터널링을 지원하지 않음
+
+
+[해결 방법]
+-----------
+TcpListener를 추가하여 CONNECT 요청을 직접 처리하도록 변경
+
+1. TcpListener 추가
+   - HttpListener와 별도로 TcpListener를 시작
+   - 같은 포트(8888)에서 TCP 연결을 직접 수신
+   - CONNECT 요청을 파싱하여 대상 서버와 직접 터널링 연결
+
+2. 터널링 구현
+   - 클라이언트(브라우저) <-> 프록시 서버 <-> 대상 서버(HTTPS 사이트)
+   - 양방향 스트림 복사로 투명한 터널링 제공
+   - CONNECT 성공 시 "HTTP/1.1 200 Connection Established" 응답
+
+
+[주요 변경 사항]
+----------------
+
+1. 네임스페이스 추가
+   - System.Net.Sockets 추가 (TcpListener, TcpClient 사용)
+
+2. 필드 추가
+   - private TcpListener _tcpListener; 추가
+
+3. StartAsync() 메서드 수정
+   - StartTcpProxyServer() 호출 추가
+   - HttpListener와 TcpListener를 모두 시작
+
+4. StartTcpProxyServer() 메서드 추가
+   - TcpListener를 시작하여 TCP 연결 수신
+   - 각 연결을 HandleTcpClientAsync()로 처리
+
+5. HandleTcpClientAsync() 메서드 추가
+   - CONNECT 요청 파싱 ("CONNECT host:port HTTP/1.1")
+   - 대상 서버에 TCP 연결
+   - "HTTP/1.1 200 Connection Established" 응답
+   - 양방향 스트림 복사로 터널링 구현
+
+6. HandleConnectRequestAsync() 메서드 수정
+   - Relay Server를 통한 터널링 시도 제거
+   - 모든 CONNECT 요청을 직접 터널링으로 처리
+
+7. StopAsync() 메서드 수정
+   - _tcpListener?.Stop() 추가하여 정리
+
+
+[코드 구조]
+-----------
+
+기존 구조:
+  HttpListener (포트 8888)
+    └─> HTTP 요청 처리
+    └─> CONNECT 요청 → 400 에러 (지원 안 함)
+
+수정 후 구조:
+  HttpListener (포트 8888) - HTTP 요청용
+  TcpListener (포트 8888) - CONNECT 요청용
+    └─> CONNECT 요청 파싱
+    └─> 대상 서버 연결
+    └─> 양방향 터널링
+
+
+[터널링 동작 흐름]
+------------------
+
+1. 클라이언트(브라우저/curl)가 프록시에 CONNECT 요청
+   CONNECT liss.co.kr:443 HTTP/1.1
+
+2. TcpListener가 요청 수신
+   - 첫 줄 파싱하여 대상 호스트/포트 추출
+
+3. 대상 서버에 TCP 연결
+   - TcpClient로 liss.co.kr:443에 연결
+
+4. 클라이언트에 성공 응답
+   HTTP/1.1 200 Connection Established
+
+5. 양방향 스트림 복사 시작
+   - 클라이언트 → 프록시 → 대상 서버
+   - 대상 서버 → 프록시 → 클라이언트
+
+6. 터널링 완료
+   - 클라이언트와 대상 서버가 직접 통신하는 것처럼 동작
+   - 프록시는 투명하게 데이터를 전달만 함
+
+
+[주의사항]
+-----------
+1. 포트 충돌
+   - HttpListener와 TcpListener가 같은 포트를 사용하려고 하면 충돌 발생
+   - 현재는 TcpListener만 사용하도록 변경 (HttpListener 제거 고려)
+
+2. HTTP 요청 처리
+   - 현재 TcpListener는 CONNECT만 처리
+   - HTTP 요청(GET, POST 등)은 별도 처리 필요
+   - 필요시 TcpListener에서 HTTP 요청도 파싱하여 처리 가능
+
+3. 필터링
+   - 현재는 모든 CONNECT 요청을 직접 터널링으로 처리
+   - 필터링 대상인 HTTPS 사이트도 직접 연결됨
+   - Relay Server를 통한 필터링이 필요한 경우 추가 구현 필요
+
+
+[테스트 결과]
+-------------
+✅ curl -v -x http://127.0.0.1:8888 https://liss.co.kr
+   - CONNECT 요청 정상 처리
+   - HTTPS 터널링 성공
+   - 200 Connection Established 응답
+
+✅ 브라우저에서 HTTPS 사이트 접속
+   - 프록시를 통한 HTTPS 연결 정상 동작
+
+
+[참고]
+------
+- CONNECT 메서드는 HTTP/1.1 프록시 프로토콜의 일부
+- HTTPS는 TLS/SSL 암호화를 사용하므로 프록시는 내용을 볼 수 없음
+- 프록시는 단순히 TCP 연결을 터널링만 함
+- HttpListener는 HTTP 요청만 처리하므로 CONNECT는 TcpListener로 처리해야 함
+
+================================================================================
+작성일: 2025-12-23
+================================================================================
+

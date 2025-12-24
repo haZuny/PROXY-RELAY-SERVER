@@ -9,7 +9,7 @@ namespace ClientExternalPC
     {
         private ProxyClientA _proxyClient;
         private bool _isRunning = false;
-        private string _relayServerUrl = "http://localhost:8080";  // Relay Server 기본 주소
+        private string _relayServerUrl = "http://59.11.2.207:1209";  // Relay Server 기본 주소
         private int _proxyPort = 8888;
         private string _domainFilter = ""; // 빈 문자열이면 모든 도메인 허용, 아니면 콤마로 구분된 도메인 목록
         private string _accessToken = "default-token-change-in-production";  // Relay Server에 설정된 토큰

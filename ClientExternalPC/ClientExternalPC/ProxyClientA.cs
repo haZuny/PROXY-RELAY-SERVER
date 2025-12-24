@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
@@ -19,6 +20,7 @@ namespace ClientExternalPC
     {
         private ClientWebSocket _webSocket;
         private HttpListener _httpListener;
+        private TcpListener _tcpListener;
         private readonly string _relayServerUrl;  // http://localhost:8080
         private readonly int _proxyPort;
         private readonly string _domainFilter;
@@ -88,8 +90,8 @@ namespace ClientExternalPC
                 // WebSocket 연결
                 await ConnectToRelayAsync();
 
-                // HTTP 프록시 서버 시작
-                StartProxyServer();
+                // TCP 프록시 서버 시작 (모든 요청 처리 - CONNECT 및 HTTP)
+                StartTcpProxyServer();
 
                 // 메시지 수신 루프 시작
                 _receiveTask = Task.Run(() => ReceiveMessagesAsync(_cancellationTokenSource.Token));
@@ -122,16 +124,547 @@ namespace ClientExternalPC
                 var wsScheme = serverUri.Scheme == "https" ? "wss" : "ws";
                 var wsUrl = $"{wsScheme}://{serverUri.Host}:{serverUri.Port}/relay?type=A&token={Uri.EscapeDataString(_accessToken)}";
 
+                OnLogMessage($"[연결 시도] Relay Server 연결 시도 중: {wsUrl.Replace(_accessToken, "***")}");
                 _webSocket = new ClientWebSocket();
                 await _webSocket.ConnectAsync(new Uri(wsUrl), CancellationToken.None);
-                OnConnectionStatusChanged(true);
-                OnLogMessage($"[연결 성공] Relay Server에 연결되었습니다: {wsUrl.Replace(_accessToken, "***")}");
+                
+                // 연결 후 상태 확인
+                var state = _webSocket.State;
+                OnLogMessage($"[연결 후 상태] WebSocket 상태: {state}");
+                
+                if (state == WebSocketState.Open)
+                {
+                    OnConnectionStatusChanged(true);
+                    OnLogMessage($"[연결 성공] Relay Server에 연결되었습니다: {wsUrl.Replace(_accessToken, "***")}");
+                }
+                else
+                {
+                    OnConnectionStatusChanged(false);
+                    OnLogMessage($"[연결 실패] WebSocket 상태가 Open이 아닙니다: {state}");
+                    throw new Exception($"WebSocket 연결 실패: 상태가 {state}입니다.");
+                }
             }
             catch (Exception ex)
             {
                 OnConnectionStatusChanged(false);
                 OnLogMessage($"[연결 실패] Relay Server 연결 실패: {ex.Message}");
+                if (ex.InnerException != null)
+                {
+                    OnLogMessage($"[연결 실패 상세] 내부 오류: {ex.InnerException.Message}");
+                }
                 throw;
+            }
+        }
+
+        /// <summary>
+        /// TCP 프록시 서버 시작 (CONNECT 요청 처리용)
+        /// </summary>
+        private void StartTcpProxyServer()
+        {
+            try
+            {
+                _tcpListener = new TcpListener(IPAddress.Any, _proxyPort);
+                _tcpListener.Start();
+                OnLogMessage($"[TCP 프록시 시작] TCP 프록시 서버가 시작되었습니다: 0.0.0.0:{_proxyPort}");
+            }
+            catch (Exception ex)
+            {
+                OnLogMessage($"[TCP 프록시 오류] TCP 프록시 서버 시작 실패: {ex.Message}");
+                // TCP 리스너 시작 실패해도 HTTP 리스너는 계속 사용
+                return;
+            }
+
+            Task.Run(async () =>
+            {
+                OnLogMessage("[TCP 프록시 대기] CONNECT 요청 대기 중...");
+
+                while (_isRunning && _tcpListener != null)
+                {
+                    try
+                    {
+                        var client = await _tcpListener.AcceptTcpClientAsync();
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await HandleTcpClientAsync(client);
+                            }
+                            catch (Exception ex)
+                            {
+                                OnLogMessage($"[TCP 클라이언트 처리 오류] {ex.Message}");
+                                try
+                                {
+                                    client.Close();
+                                }
+                                catch { }
+                            }
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        if (_isRunning)
+                        {
+                            OnLogMessage($"[TCP 프록시 오류] 클라이언트 수락 오류: {ex.Message}");
+                        }
+                    }
+                }
+            });
+        }
+
+        /// <summary>
+        /// TCP 클라이언트 처리 (CONNECT 요청 파싱 및 터널링)
+        /// </summary>
+        private async Task HandleTcpClientAsync(TcpClient client)
+        {
+            var stream = client.GetStream();
+            var reader = new StreamReader(stream, Encoding.ASCII, false, 1024, true);
+            var writer = new StreamWriter(stream, Encoding.ASCII, 1024, true) { AutoFlush = true };
+
+            try
+            {
+                // 첫 번째 줄 읽기 (요청 라인)
+                var firstLine = await reader.ReadLineAsync();
+                if (string.IsNullOrEmpty(firstLine))
+                {
+                    OnLogMessage("[TCP] 빈 요청 수신");
+                    await writer.WriteLineAsync("HTTP/1.1 400 Bad Request\r\n");
+                    return;
+                }
+
+                OnLogMessage($"[TCP] 요청 수신: {firstLine}");
+
+                // 요청 파싱
+                var parts = firstLine.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 2)
+                {
+                    OnLogMessage($"[TCP] 잘못된 요청 형식: {firstLine}");
+                    await writer.WriteLineAsync("HTTP/1.1 400 Bad Request\r\n");
+                    return;
+                }
+
+                var method = parts[0];
+                var target = parts[1];
+
+                // CONNECT 요청 처리
+                if (method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
+                {
+
+                    // CONNECT 요청 파싱: "CONNECT host:port HTTP/1.1"
+                    var targetParts = target.Split(':');
+                    var targetHost = targetParts[0];
+                    var targetPort = 443;
+
+                    if (targetParts.Length > 1 && int.TryParse(targetParts[1], out int port))
+                    {
+                        targetPort = port;
+                    }
+
+                    OnLogMessage($"[TCP CONNECT] 대상: {targetHost}:{targetPort}");
+
+                    // 나머지 헤더 읽기 (무시)
+                    string line;
+                    while (!string.IsNullOrEmpty(line = await reader.ReadLineAsync()))
+                    {
+                        // 헤더 읽기 (빈 줄까지)
+                    }
+
+                    // 모든 CONNECT 요청은 직접 터널링으로 처리
+                    OnLogMessage($"[TCP CONNECT] 직접 터널링 시작: {targetHost}:{targetPort}");
+
+                    // 대상 서버에 연결
+                    using (var targetClient = new TcpClient())
+                    {
+                        await targetClient.ConnectAsync(targetHost, targetPort);
+                        OnLogMessage($"[TCP CONNECT] 대상 서버 연결 성공: {targetHost}:{targetPort}");
+
+                        // CONNECT 성공 응답
+                        await writer.WriteLineAsync("HTTP/1.1 200 Connection Established\r\n");
+                        await writer.FlushAsync();
+
+                        // 양방향 스트림 복사
+                        var targetStream = targetClient.GetStream();
+                        var clientStream = client.GetStream();
+
+                        // 클라이언트 -> 서버
+                        var copyToServer = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                var buffer = new byte[8192];
+                                int bytesRead;
+                                while ((bytesRead = await clientStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                                {
+                                    await targetStream.WriteAsync(buffer, 0, bytesRead);
+                                    await targetStream.FlushAsync();
+                                }
+                            }
+                            catch (ObjectDisposedException)
+                            {
+                                // 스트림이 이미 닫힌 경우 - 정상 종료
+                            }
+                            catch (Exception ex)
+                            {
+                                // 다른 예외만 로그
+                                if (!ex.Message.Contains("삭제된 개체") && !ex.Message.Contains("ObjectDisposed"))
+                                {
+                                    OnLogMessage($"[TCP CONNECT] 클라이언트->서버 스트림 오류: {ex.Message}");
+                                }
+                            }
+                        });
+
+                        // 서버 -> 클라이언트
+                        var copyToClient = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                var buffer = new byte[8192];
+                                int bytesRead;
+                                while ((bytesRead = await targetStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                                {
+                                    await clientStream.WriteAsync(buffer, 0, bytesRead);
+                                    await clientStream.FlushAsync();
+                                }
+                            }
+                            catch (ObjectDisposedException)
+                            {
+                                // 스트림이 이미 닫힌 경우 - 정상 종료
+                            }
+                            catch (Exception ex)
+                            {
+                                // 다른 예외만 로그
+                                if (!ex.Message.Contains("삭제된 개체") && !ex.Message.Contains("ObjectDisposed"))
+                                {
+                                    OnLogMessage($"[TCP CONNECT] 서버->클라이언트 스트림 오류: {ex.Message}");
+                                }
+                            }
+                        });
+
+                        // 양방향 중 하나라도 종료되면 대기
+                        try
+                        {
+                            await Task.WhenAny(copyToServer, copyToClient);
+                        }
+                        catch { }
+                        
+                        // 스트림 정리
+                        try
+                        {
+                            targetStream?.Close();
+                        }
+                        catch { }
+                        
+                        OnLogMessage($"[TCP CONNECT] 터널링 종료: {targetHost}:{targetPort}");
+                    }
+                }
+                else
+                {
+                    // HTTP 요청 처리 (GET, POST 등)
+                    await HandleHttpRequestAsync(client, stream, reader, writer, method, target, firstLine);
+                }
+            }
+            catch (Exception ex)
+            {
+                OnLogMessage($"[TCP 오류] 처리 오류: {ex.Message}");
+                try
+                {
+                    await writer.WriteLineAsync("HTTP/1.1 502 Bad Gateway\r\n");
+                }
+                catch { }
+            }
+            finally
+            {
+                try
+                {
+                    client.Close();
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
+        /// HTTP 요청 처리 (TcpListener에서 받은 HTTP 요청)
+        /// </summary>
+        private async Task HandleHttpRequestAsync(TcpClient client, NetworkStream stream, StreamReader reader, StreamWriter writer, string method, string target, string firstLine)
+        {
+            try
+            {
+                // 헤더 먼저 읽기 (URL 파싱에 필요할 수 있음)
+                var requestHeaders = new Dictionary<string, string>();
+                string headerLine;
+                while (!string.IsNullOrEmpty(headerLine = await reader.ReadLineAsync()))
+                {
+                    var colonIndex = headerLine.IndexOf(':');
+                    if (colonIndex > 0)
+                    {
+                        var key = headerLine.Substring(0, colonIndex).Trim();
+                        var value = headerLine.Substring(colonIndex + 1).Trim();
+                        requestHeaders[key] = value;
+                    }
+                }
+
+                // URL 파싱: "http://host:port/path" 또는 "http://host/path"
+                Uri requestUri;
+                if (Uri.TryCreate(target, UriKind.Absolute, out requestUri))
+                {
+                    // 절대 URL
+                }
+                else if (target.StartsWith("/"))
+                {
+                    // 상대 URL - Host 헤더에서 호스트 추출
+                    if (requestHeaders.ContainsKey("Host"))
+                    {
+                        var host = requestHeaders["Host"];
+                        if (host.Contains(":"))
+                        {
+                            var parts = host.Split(':');
+                            requestUri = new Uri($"http://{parts[0]}:{parts[1]}{target}");
+                        }
+                        else
+                        {
+                            requestUri = new Uri($"http://{host}{target}");
+                        }
+                    }
+                    else
+                    {
+                        OnLogMessage($"[TCP HTTP] Host 헤더가 없습니다: {firstLine}");
+                        await writer.WriteLineAsync("HTTP/1.1 400 Bad Request\r\n");
+                        return;
+                    }
+                }
+                else
+                {
+                    OnLogMessage($"[TCP HTTP] 잘못된 URL 형식: {target}");
+                    await writer.WriteLineAsync("HTTP/1.1 400 Bad Request\r\n");
+                    return;
+                }
+
+                OnLogMessage($"[TCP HTTP] 요청 처리: {method} {requestUri}");
+
+                // 필터링 체크
+                bool shouldProxy = ShouldProxyRequest(requestUri);
+                
+                if (!shouldProxy)
+                {
+                    // 필터링 대상이 아니면 직접 통과
+                    OnLogMessage($"[TCP HTTP 직접] {method} {requestUri} - 직접 통과");
+                    await HandleDirectHttpRequestAsync(client, stream, requestHeaders, method, requestUri);
+                    return;
+                }
+
+                // 필터링 대상이면 Relay Server 경유
+                OnLogMessage($"[TCP HTTP Relay] {method} {requestUri} - Relay Server 경유");
+
+                // 요청 본문 읽기 (있는 경우)
+                string requestBody = null;
+                if (requestHeaders.ContainsKey("Content-Length"))
+                {
+                    var contentLength = int.Parse(requestHeaders["Content-Length"]);
+                    if (contentLength > 0 && contentLength < 10 * 1024 * 1024) // 10MB 제한
+                    {
+                        var bodyBytes = new byte[contentLength];
+                        var totalRead = 0;
+                        while (totalRead < contentLength)
+                        {
+                            var bytesRead = await stream.ReadAsync(bodyBytes, totalRead, contentLength - totalRead);
+                            if (bytesRead == 0) break;
+                            totalRead += bytesRead;
+                        }
+                        requestBody = Encoding.UTF8.GetString(bodyBytes, 0, totalRead);
+                    }
+                }
+
+                // Relay Server로 전송
+                var sessionId = Guid.NewGuid().ToString();
+                var relayMessage = new RelayMessage
+                {
+                    Type = "REQUEST",
+                    SessionId = sessionId,
+                    Method = method,
+                    Url = requestUri.ToString(),
+                    Headers = requestHeaders,
+                    Body = requestBody
+                };
+
+                // WebSocket 연결 상태 확인
+                if (_webSocket == null || _webSocket.State != WebSocketState.Open)
+                {
+                    OnLogMessage($"[TCP HTTP Relay 실패] WebSocket이 연결되지 않았습니다.");
+                    await writer.WriteLineAsync("HTTP/1.1 502 Bad Gateway\r\n");
+                    return;
+                }
+
+                // Relay Server로 전송
+                await SendMessageAsync(relayMessage);
+
+                // 응답 대기
+                var tcs = new TaskCompletionSource<RelayMessage>();
+                lock (_pendingRequests)
+                {
+                    _pendingRequests[sessionId] = tcs;
+                }
+
+                try
+                {
+                    var timeoutTask = Task.Delay(TimeSpan.FromSeconds(60));
+                    var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
+
+                    if (completedTask == timeoutTask)
+                    {
+                        lock (_pendingRequests)
+                        {
+                            _pendingRequests.Remove(sessionId);
+                        }
+                        await writer.WriteLineAsync("HTTP/1.1 504 Gateway Timeout\r\n");
+                        return;
+                    }
+
+                    var relayResponse = await tcs.Task;
+                    lock (_pendingRequests)
+                    {
+                        _pendingRequests.Remove(sessionId);
+                    }
+
+                    // 응답 전송
+                    var statusCode = relayResponse.StatusCode ?? 500;
+                    await writer.WriteLineAsync($"HTTP/1.1 {statusCode} {GetStatusDescription(statusCode)}\r\n");
+                    
+                    if (relayResponse.Headers != null)
+                    {
+                        foreach (var header in relayResponse.Headers)
+                        {
+                            if (!header.Key.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase) &&
+                                !header.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                            {
+                                await writer.WriteLineAsync($"{header.Key}: {header.Value}\r\n");
+                            }
+                        }
+                    }
+                    
+                    await writer.WriteLineAsync("\r\n");
+                    
+                    if (!string.IsNullOrEmpty(relayResponse.Body))
+                    {
+                        var bodyBytes = Encoding.UTF8.GetBytes(relayResponse.Body);
+                        await stream.WriteAsync(bodyBytes, 0, bodyBytes.Length);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lock (_pendingRequests)
+                    {
+                        _pendingRequests.Remove(sessionId);
+                    }
+                    OnLogMessage($"[TCP HTTP Relay 오류] 응답 처리 오류: {ex.Message}");
+                    await writer.WriteLineAsync("HTTP/1.1 502 Bad Gateway\r\n");
+                }
+            }
+            catch (Exception ex)
+            {
+                OnLogMessage($"[TCP HTTP 오류] 처리 오류: {ex.Message}");
+                try
+                {
+                    await writer.WriteLineAsync("HTTP/1.1 500 Internal Server Error\r\n");
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
+        /// 직접 HTTP 요청 처리 (필터링 대상이 아닌 경우)
+        /// </summary>
+        private async Task HandleDirectHttpRequestAsync(TcpClient client, NetworkStream stream, Dictionary<string, string> headers, string method, Uri requestUri)
+        {
+            var writer = new StreamWriter(stream, Encoding.ASCII, 1024, true) { AutoFlush = true };
+            
+            try
+            {
+
+                // HttpClient로 직접 요청
+                var handler = new HttpClientHandler
+                {
+                    UseProxy = false,
+                    Proxy = null
+                };
+                
+                using (var httpClient = new HttpClient(handler))
+                {
+                    httpClient.Timeout = TimeSpan.FromSeconds(30);
+                    
+                    var httpRequest = new HttpRequestMessage(new HttpMethod(method), requestUri);
+                    
+                    // 헤더 복사
+                    foreach (var header in headers)
+                    {
+                        if (!header.Key.Equals("Proxy-", StringComparison.OrdinalIgnoreCase) &&
+                            !header.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase) &&
+                            !header.Key.Equals("Keep-Alive", StringComparison.OrdinalIgnoreCase) &&
+                            !header.Key.Equals("Host", StringComparison.OrdinalIgnoreCase))
+                        {
+                            try
+                            {
+                                httpRequest.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                            }
+                            catch { }
+                        }
+                    }
+
+                    // 요청 본문
+                    if (headers.ContainsKey("Content-Length"))
+                    {
+                        var contentLength = int.Parse(headers["Content-Length"]);
+                        if (contentLength > 0 && contentLength < 10 * 1024 * 1024)
+                        {
+                            var bodyBytes = new byte[contentLength];
+                            var totalRead = 0;
+                            while (totalRead < contentLength)
+                            {
+                                var bytesRead = await stream.ReadAsync(bodyBytes, totalRead, contentLength - totalRead);
+                                if (bytesRead == 0) break;
+                                totalRead += bytesRead;
+                            }
+                            httpRequest.Content = new ByteArrayContent(bodyBytes, 0, totalRead);
+                            if (headers.ContainsKey("Content-Type"))
+                            {
+                                httpRequest.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(headers["Content-Type"]);
+                            }
+                        }
+                    }
+
+                    var httpResponse = await httpClient.SendAsync(httpRequest);
+                    
+                    // 응답 전송
+                    await writer.WriteLineAsync($"HTTP/1.1 {(int)httpResponse.StatusCode} {httpResponse.ReasonPhrase}\r\n");
+                    
+                    foreach (var header in httpResponse.Headers)
+                    {
+                        if (!header.Key.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase))
+                        {
+                            await writer.WriteLineAsync($"{header.Key}: {string.Join(", ", header.Value)}\r\n");
+                        }
+                    }
+                    
+                    foreach (var header in httpResponse.Content.Headers)
+                    {
+                        if (!header.Key.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase))
+                        {
+                            await writer.WriteLineAsync($"{header.Key}: {string.Join(", ", header.Value)}\r\n");
+                        }
+                    }
+                    
+                    await writer.WriteLineAsync("\r\n");
+                    
+                    var responseBody = await httpResponse.Content.ReadAsByteArrayAsync();
+                    await stream.WriteAsync(responseBody, 0, responseBody.Length);
+                }
+            }
+            catch (Exception ex)
+            {
+                OnLogMessage($"[TCP HTTP 직접 오류] 처리 오류: {ex.Message}");
+                try
+                {
+                    await writer.WriteLineAsync("HTTP/1.1 502 Bad Gateway\r\n");
+                }
+                catch { }
             }
         }
 
@@ -165,14 +698,59 @@ namespace ClientExternalPC
                     try
                     {
                         var context = await _httpListener.GetContextAsync();
-                        OnLogMessage("[프록시 수신] 새로운 요청이 들어왔습니다!");
-                        _ = Task.Run(() => HandleProxyRequestAsync(context));
+                        var request = context.Request;
+                        OnLogMessage($"[프록시 수신] 새로운 요청이 들어왔습니다! Method: {request.HttpMethod}, RawUrl: {request.RawUrl ?? "null"}, Url: {request.Url?.ToString() ?? "null"}");
+                        
+                        // CONNECT 요청인 경우 즉시 로그
+                        if (request.HttpMethod == "CONNECT")
+                        {
+                            OnLogMessage($"[CONNECT 수신] CONNECT 요청 수신: {request.RawUrl}");
+                        }
+                        
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await HandleProxyRequestAsync(context);
+                            }
+                            catch (Exception ex)
+                            {
+                                OnLogMessage($"[요청 처리 오류] HandleProxyRequestAsync 예외: {ex.Message}");
+                                if (ex.InnerException != null)
+                                {
+                                    OnLogMessage($"[요청 처리 오류 상세] 내부 오류: {ex.InnerException.Message}");
+                                }
+                                OnLogMessage($"[요청 처리 오류 상세] 스택 트레이스: {ex.StackTrace}");
+                                
+                                // 예외 발생 시 응답 처리
+                                try
+                                {
+                                    var response = context.Response;
+                                    response.StatusCode = 500;
+                                    response.StatusDescription = "Internal Server Error";
+                                    response.ContentLength64 = 0;
+                                    response.Close();
+                                }
+                                catch { }
+                            }
+                        });
+                    }
+                    catch (HttpListenerException ex)
+                    {
+                        if (_isRunning)
+                        {
+                            OnLogMessage($"[HttpListener 예외] HttpListener 예외 발생: {ex.Message} (ErrorCode: {ex.ErrorCode})");
+                        }
                     }
                     catch (Exception ex)
                     {
                         if (_isRunning)
                         {
                             OnLogMessage($"[요청 오류] 프록시 요청 처리 오류: {ex.Message}");
+                            if (ex.InnerException != null)
+                            {
+                                OnLogMessage($"[요청 오류 상세] 내부 오류: {ex.InnerException.Message}");
+                            }
                         }
                     }
                 }
@@ -191,12 +769,16 @@ namespace ClientExternalPC
             try
             {
                 // 모든 요청에 대해 로그 기록 (요청이 들어오는지 확인)
-                OnLogMessage($"[요청 수신] [{requestId}] {request.HttpMethod} {request.Url} - 도메인: {request.Url?.Host ?? "null"}");
+                // CONNECT 요청의 경우 request.Url이 null일 수 있으므로 RawUrl 사용
+                var requestUrl = request.Url?.ToString() ?? request.RawUrl ?? "unknown";
+                var requestHost = request.Url?.Host ?? (request.RawUrl?.Split(':')[0] ?? "null");
+                OnLogMessage($"[요청 수신] [{requestId}] {request.HttpMethod} {requestUrl} - 도메인: {requestHost}");
                 OnLogMessage($"[요청 상세] [{requestId}] User-Agent: {request.UserAgent ?? "없음"}, RemoteEndPoint: {request.RemoteEndPoint}");
 
                 // CONNECT 메서드 처리 (HTTPS 터널링) - 필터링 체크 전에 처리
                 if (request.HttpMethod == "CONNECT")
                 {
+                    OnLogMessage($"[CONNECT 감지] [{requestId}] CONNECT 요청 감지됨: {request.RawUrl}");
                     await HandleConnectRequestAsync(context);
                     return;
                 }
@@ -215,12 +797,12 @@ namespace ClientExternalPC
                 OnLogMessage($"[Relay 경유] {request.HttpMethod} {request.Url} - 도메인 '{request.Url?.Host}'이(가) 필터 목록에 있어 Relay Server를 경유합니다");
 
                 // 프록시를 통한 요청의 URL 재구성 (프록시 포트 제거)
-                Uri requestUrl = request.Url;
-                string targetHost = requestUrl.Host;
-                int targetPort = requestUrl.Port;
-                string scheme = requestUrl.Scheme;
-                string path = requestUrl.AbsolutePath;
-                string query = requestUrl.Query;
+                Uri originalUrl = request.Url;
+                string targetHost = originalUrl.Host;
+                int targetPort = originalUrl.Port;
+                string scheme = originalUrl.Scheme;
+                string path = originalUrl.AbsolutePath;
+                string query = originalUrl.Query;
                 
                 // 프록시 포트(8888)가 포함되어 있으면 제거하고 기본 포트 사용
                 if (targetPort == _proxyPort)
@@ -775,75 +1357,121 @@ namespace ClientExternalPC
             try
             {
                 // 직접 TCP 연결
-                OnLogMessage($"[CONNECT 직접] {targetHost} 직접 연결 시작");
-                
                 var port = 443; // HTTPS 기본 포트
-                if (request.RawUrl.Contains(":"))
+                var rawUrl = request.RawUrl ?? "";
+                
+                if (rawUrl.Contains(":"))
                 {
-                    var parts = request.RawUrl.Split(':');
+                    var parts = rawUrl.Split(':');
                     if (parts.Length > 1 && int.TryParse(parts[1], out int parsedPort))
                     {
                         port = parsedPort;
                     }
                 }
+                
+                OnLogMessage($"[CONNECT 직접] {targetHost}:{port} 직접 연결 시작 (RawUrl: {rawUrl})");
 
                 using (var tcpClient = new System.Net.Sockets.TcpClient())
                 {
                     await tcpClient.ConnectAsync(targetHost, port);
                     OnLogMessage($"[CONNECT 직접 성공] {targetHost}:{port} 연결 성공");
 
-                    // CONNECT 성공 응답
+                    // CONNECT 성공 응답 (헤더만 전송)
+                    // HttpListener의 경우 CONNECT 요청에 대해 특별한 처리가 필요함
                     response.StatusCode = 200;
                     response.StatusDescription = "Connection Established";
+                    response.Headers.Clear(); // 기존 헤더 제거
                     response.Headers.Add("Connection", "keep-alive");
-                    await response.OutputStream.FlushAsync();
+                    response.SendChunked = false;
+                    response.ContentLength64 = 0;
+                    
+                    // HttpListener에서 CONNECT 응답 헤더를 전송하려면
+                    // OutputStream에 빈 바이트를 쓰거나, 헤더를 명시적으로 전송해야 함
+                    // 여기서는 헤더만 전송하고 터널링을 시작함
+                    var outputStream = response.OutputStream;
+                    
+                    // 헤더 전송을 위해 빈 바이트를 쓰거나 FlushAsync 호출
+                    // HttpListener는 첫 Write/Flush 시 헤더를 전송함
+                    await outputStream.FlushAsync();
+                    OnLogMessage($"[CONNECT 직접] 응답 헤더 전송 완료, 터널링 시작");
 
                     // 스트림 터널링 (양방향)
-                    var clientStream = tcpClient.GetStream();
-                    var serverStream = response.OutputStream;
+                    var serverStream = tcpClient.GetStream();
+                    var clientOutputStream = response.OutputStream;
+                    var clientInputStream = request.InputStream;
+                    
+                    OnLogMessage($"[CONNECT 직접] 양방향 터널링 시작 - 서버 스트림: {serverStream.CanRead}/{serverStream.CanWrite}, 클라이언트 출력: {clientOutputStream.CanWrite}, 클라이언트 입력: {clientInputStream.CanRead}");
 
                     // 양방향 스트림 복사
-                    var copyToServer = Task.Run(async () =>
+                    // 서버 -> 클라이언트 (대상 서버에서 받은 데이터를 브라우저로 전송)
+                    var copyToClient = Task.Run(async () =>
                     {
                         try
                         {
-                            var buffer = new byte[4096];
+                            var buffer = new byte[8192];
                             int bytesRead;
-                            while ((bytesRead = await clientStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                            int totalBytes = 0;
+                            while ((bytesRead = await serverStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                            {
+                                await clientOutputStream.WriteAsync(buffer, 0, bytesRead);
+                                await clientOutputStream.FlushAsync();
+                                totalBytes += bytesRead;
+                            }
+                            OnLogMessage($"[CONNECT 직접] 서버->클라이언트 스트림 종료 (총 {totalBytes} bytes 전송)");
+                        }
+                        catch (Exception ex)
+                        {
+                            OnLogMessage($"[CONNECT 직접] 서버->클라이언트 스트림 오류: {ex.Message}");
+                            if (ex.InnerException != null)
+                            {
+                                OnLogMessage($"[CONNECT 직접] 서버->클라이언트 스트림 내부 오류: {ex.InnerException.Message}");
+                            }
+                        }
+                    });
+
+                    // 클라이언트 -> 서버 (브라우저에서 받은 데이터를 대상 서버로 전송)
+                    var copyFromClient = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var buffer = new byte[8192];
+                            int bytesRead;
+                            int totalBytes = 0;
+                            while ((bytesRead = await clientInputStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
                             {
                                 await serverStream.WriteAsync(buffer, 0, bytesRead);
                                 await serverStream.FlushAsync();
+                                totalBytes += bytesRead;
                             }
+                            OnLogMessage($"[CONNECT 직접] 클라이언트->서버 스트림 종료 (총 {totalBytes} bytes 전송)");
                         }
-                        catch { }
-                    });
-
-                    var copyFromServer = Task.Run(async () =>
-                    {
-                        try
+                        catch (Exception ex)
                         {
-                            var buffer = new byte[4096];
-                            int bytesRead;
-                            while ((bytesRead = await request.InputStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                            OnLogMessage($"[CONNECT 직접] 클라이언트->서버 스트림 오류: {ex.Message}");
+                            if (ex.InnerException != null)
                             {
-                                await clientStream.WriteAsync(buffer, 0, bytesRead);
-                                await clientStream.FlushAsync();
+                                OnLogMessage($"[CONNECT 직접] 클라이언트->서버 스트림 내부 오류: {ex.InnerException.Message}");
                             }
                         }
-                        catch { }
                     });
 
-                    await Task.WhenAny(copyToServer, copyFromServer);
+                    // 양방향 스트림 중 하나라도 종료되면 대기
+                    await Task.WhenAny(copyToClient, copyFromClient);
                     OnLogMessage($"[CONNECT 직접 종료] {targetHost} 연결 종료");
                 }
             }
             catch (Exception ex)
             {
                 OnLogMessage($"[CONNECT 직접 오류] {targetHost} - 오류: {ex.Message}");
+                if (ex.InnerException != null)
+                {
+                    OnLogMessage($"[CONNECT 직접 오류 상세] 내부 오류: {ex.InnerException.Message}");
+                }
                 try
                 {
                     response.StatusCode = 502;
                     response.StatusDescription = "Bad Gateway";
+                    response.ContentLength64 = 0;
                     response.Close();
                 }
                 catch { }
@@ -863,211 +1491,23 @@ namespace ClientExternalPC
                 // CONNECT 요청의 RawUrl은 "www.naver.com:443" 형식
                 var rawUrl = request.RawUrl ?? "";
                 var targetHost = rawUrl.Split(':')[0];
-                OnLogMessage($"[CONNECT] HTTPS 터널링 요청: {rawUrl} -> {targetHost}");
-
-                // 필터링 체크
-                bool shouldProxy = false;
-                if (!string.IsNullOrEmpty(targetHost))
+                var targetPort = 443; // 기본 HTTPS 포트
+                if (rawUrl.Contains(":"))
                 {
-                    var testUrl = new Uri($"https://{targetHost}");
-                    shouldProxy = ShouldProxyRequest(testUrl);
-                    
-                    if (!shouldProxy)
+                    var parts = rawUrl.Split(':');
+                    if (parts.Length > 1 && int.TryParse(parts[1], out int parsedPort))
                     {
-                        // 필터링 대상이 아니면 직접 통과 (패싱)
-                        OnLogMessage($"[CONNECT 직접 통과] 도메인 '{targetHost}'이(가) 필터 목록에 없어 직접 통과합니다");
-                        await HandleDirectConnectAsync(context, targetHost);
-                        return;
+                        targetPort = parsedPort;
                     }
                 }
+                OnLogMessage($"[CONNECT] HTTPS 터널링 요청 수신: {rawUrl} -> {targetHost}:{targetPort}");
 
-                // CONNECT 요청을 Relay Server로 전달
-                var sessionId = Guid.NewGuid().ToString();
-                var relayMessage = new RelayMessage
-                {
-                    Type = "REQUEST",
-                    SessionId = sessionId,
-                    Method = "CONNECT",
-                    Url = $"https://{targetHost}",
-                    Headers = new Dictionary<string, string>()
-                };
-
-                // WebSocket 연결 상태 확인
-                if (_webSocket == null || _webSocket.State != WebSocketState.Open)
-                {
-                    OnLogMessage($"[CONNECT 실패] WebSocket이 연결되지 않았습니다. 상태: {_webSocket?.State ?? WebSocketState.None}");
-                    response.StatusCode = 502;
-                    response.StatusDescription = "Bad Gateway - WebSocket not connected";
-                    response.Close();
-                    return;
-                }
-
-                // Relay Server로 전송
-                OnLogMessage($"[CONNECT 전송] Relay Server로 CONNECT 요청 전송: {targetHost}");
-                try
-                {
-                    await SendMessageAsync(relayMessage);
-                    OnLogMessage($"[CONNECT 전송 성공] Relay Server로 CONNECT 요청 전송 완료: {targetHost}");
-                }
-                catch (Exception ex)
-                {
-                    var errorDetails = ex.Message;
-                    if (ex.InnerException != null)
-                    {
-                        errorDetails += $" (내부 오류: {ex.InnerException.Message})";
-                    }
-                    OnLogMessage($"[CONNECT 전송 실패] Relay Server로 CONNECT 요청 전송 실패: {errorDetails}");
-                    response.StatusCode = 502;
-                    response.StatusDescription = "Bad Gateway - Failed to send CONNECT request";
-                    response.Close();
-                    return;
-                }
-
-                // 응답 대기
-                var tcs = new TaskCompletionSource<RelayMessage>();
-                lock (_pendingRequests)
-                {
-                    _pendingRequests[sessionId] = tcs;
-                }
-
-                try
-                {
-                    var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10));
-                    var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
-
-                    if (completedTask == timeoutTask)
-                    {
-                        // 타임아웃 시 TaskCompletionSource를 완료시켜서 무한 대기 방지
-                        TaskCompletionSource<RelayMessage> timeoutTcs = null;
-                        lock (_pendingRequests)
-                        {
-                            if (_pendingRequests.ContainsKey(sessionId))
-                            {
-                                timeoutTcs = _pendingRequests[sessionId];
-                                _pendingRequests.Remove(sessionId);
-                            }
-                        }
-                        
-                        if (timeoutTcs != null)
-                        {
-                            // 타임아웃 응답 생성
-                            var timeoutResponse = new RelayMessage
-                            {
-                                Type = "RESPONSE",
-                                SessionId = sessionId,
-                                StatusCode = 504,
-                                Error = "Gateway Timeout - 10초 내 응답 없음"
-                            };
-                            
-                            // TaskCompletionSource를 완료시켜서 무한 대기 방지
-                            try
-                            {
-                                timeoutTcs.TrySetResult(timeoutResponse);
-                            }
-                            catch { }
-                        }
-                        
-                        OnLogMessage($"[CONNECT 타임아웃] CONNECT 요청 타임아웃: {targetHost}");
-                        response.StatusCode = 504;
-                        response.StatusDescription = "Gateway Timeout";
-                        response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
-                        response.Headers.Set("Pragma", "no-cache");
-                        response.Headers.Set("Expires", "0");
-                        response.Headers.Set("Retry-After", "3600");
-                        response.Headers.Set("Connection", "close");
-                        response.ContentLength64 = 0;
-                        response.Close();
-                        return;
-                    }
-
-                    RelayMessage relayResponse;
-                    try
-                    {
-                        relayResponse = await tcs.Task;
-                        
-                        // 응답을 받았으므로 _pendingRequests에서 제거
-                        lock (_pendingRequests)
-                        {
-                            _pendingRequests.Remove(sessionId);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        // 예외 발생 시에도 _pendingRequests에서 제거
-                        lock (_pendingRequests)
-                        {
-                            _pendingRequests.Remove(sessionId);
-                        }
-                        OnLogMessage($"[CONNECT 응답 수신 오류] 응답 수신 중 오류 발생: {ex.Message}");
-                        response.StatusCode = 502;
-                        response.StatusDescription = "Bad Gateway - Error receiving CONNECT response";
-                        response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
-                        response.Headers.Set("Pragma", "no-cache");
-                        response.Headers.Set("Expires", "0");
-                        response.Headers.Set("Retry-After", "3600");
-                        response.Headers.Set("Connection", "close");
-                        response.ContentLength64 = 0;
-                        response.Close();
-                        return;
-                    }
-
-                    if (relayResponse.StatusCode == 200)
-                    {
-                        // CONNECT 성공 - 터널링 시작
-                        response.StatusCode = 200;
-                        response.StatusDescription = "Connection Established";
-                        response.Headers.Add("Connection", "keep-alive");
-                        await response.OutputStream.FlushAsync();
-                        OnLogMessage($"[CONNECT 성공] HTTPS 터널링 시작: {targetHost}");
-                        // 실제 터널링은 복잡하므로 여기서는 연결만 확인
-                        response.Close();
-                    }
-                    else
-                    {
-                        OnLogMessage($"[CONNECT 실패] Relay Server 응답: {relayResponse.StatusCode}");
-                        var errorStatusCode = relayResponse.StatusCode ?? 502;
-                        response.StatusCode = errorStatusCode;
-                        response.StatusDescription = relayResponse.Error ?? "Bad Gateway";
-                        
-                        // 5xx 에러 시 브라우저 재시도 방지
-                        if (errorStatusCode >= 500)
-                        {
-                            try
-                            {
-                                response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
-                                response.Headers.Set("Pragma", "no-cache");
-                                response.Headers.Set("Expires", "0");
-                                response.Headers.Set("Retry-After", "3600");
-                                response.Headers.Set("Connection", "close");
-                            }
-                            catch { }
-                        }
-                        response.ContentLength64 = 0;
-                        response.Close();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    // 예외 발생 시에도 _pendingRequests에서 제거
-                    lock (_pendingRequests)
-                    {
-                        _pendingRequests.Remove(sessionId);
-                    }
-                    OnLogMessage($"[CONNECT 응답 처리 오류] 응답 처리 중 오류 발생: {ex.Message}");
-                    try
-                    {
-                        response.StatusCode = 502;
-                        response.StatusDescription = "Bad Gateway - Error processing CONNECT response";
-                        response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
-                        response.Headers.Set("Pragma", "no-cache");
-                        response.Headers.Set("Expires", "0");
-                        response.Headers.Set("Retry-After", "3600");
-                        response.Headers.Set("Connection", "close");
-                        response.ContentLength64 = 0;
-                        response.Close();
-                    }
-                    catch { }
-                }
+                // CONNECT 요청은 항상 직접 터널링으로 처리
+                // Relay Server는 JSON 메시지만 처리하고, CONNECT 터널링의 바이너리 스트리밍은 지원하지 않음
+                // 따라서 모든 HTTPS 요청은 직접 연결로 처리
+                OnLogMessage($"[CONNECT 직접 터널링] HTTPS 터널링은 직접 연결로 처리됩니다: {targetHost}:{targetPort}");
+                await HandleDirectConnectAsync(context, targetHost);
+                return;
             }
             catch (Exception ex)
             {
@@ -1143,15 +1583,55 @@ namespace ClientExternalPC
                     }
 
                     OnLogMessage($"[WebSocket 수신 대기] 메시지 수신 대기 중... (상태: {_webSocket.State})");
+                    
                     var result = await _webSocket.ReceiveAsync(
                         new ArraySegment<byte>(buffer),
                         cancellationToken
                     );
                     OnLogMessage($"[WebSocket 메시지 수신] MessageType: {result.MessageType}, Count: {result.Count}, EndOfMessage: {result.EndOfMessage}");
 
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        OnConnectionStatusChanged(false);
+                        OnLogMessage("[연결 종료] WebSocket 연결이 종료되었습니다.");
+                        break;
+                    }
+
+                    // 여러 청크로 나뉜 메시지를 수집하기 위한 버퍼
+                    var messageBuffer = new List<byte>();
+                    
+                    // 첫 번째 청크 추가
+                    if (result.MessageType == WebSocketMessageType.Text || result.MessageType == WebSocketMessageType.Binary)
+                    {
+                        messageBuffer.AddRange(buffer.Take(result.Count));
+                    }
+                    
+                    // 메시지가 완전히 수신될 때까지 모든 청크 수집
+                    while (!result.EndOfMessage)
+                    {
+                        result = await _webSocket.ReceiveAsync(
+                            new ArraySegment<byte>(buffer),
+                            cancellationToken
+                        );
+                        OnLogMessage($"[WebSocket 메시지 청크 수신] MessageType: {result.MessageType}, Count: {result.Count}, EndOfMessage: {result.EndOfMessage}");
+                        
+                        if (result.MessageType == WebSocketMessageType.Close)
+                        {
+                            OnConnectionStatusChanged(false);
+                            OnLogMessage("[연결 종료] WebSocket 연결이 종료되었습니다.");
+                            return; // 외부 루프도 종료
+                        }
+                        
+                        if (result.MessageType == WebSocketMessageType.Text || result.MessageType == WebSocketMessageType.Binary)
+                        {
+                            messageBuffer.AddRange(buffer.Take(result.Count));
+                        }
+                    }
+
+                    // Close 메시지가 아닌 경우에만 처리
                     if (result.MessageType == WebSocketMessageType.Text)
                     {
-                        var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                        var json = Encoding.UTF8.GetString(messageBuffer.ToArray());
                         OnLogMessage($"[WebSocket JSON 수신] JSON 길이: {json.Length}, 내용 (처음 200자): {json.Substring(0, Math.Min(200, json.Length))}");
                         var message = DeserializeMessage(json);
                         OnLogMessage($"[WebSocket 메시지 파싱 완료] Type: {message.Type}, SessionId: {message.SessionId ?? "null"}, StatusCode: {message.StatusCode}");
@@ -1318,6 +1798,12 @@ namespace ClientExternalPC
             {
                 _httpListener?.Stop();
                 _httpListener?.Close();
+            }
+            catch { }
+
+            try
+            {
+                _tcpListener?.Stop();
             }
             catch { }
 
