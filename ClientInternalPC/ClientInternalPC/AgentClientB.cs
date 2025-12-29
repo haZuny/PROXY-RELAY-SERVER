@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Configuration;
 using System.Linq;
 using System.Net.Http;
+using System.Net.Security;
 using System.Net.WebSockets;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -40,8 +42,39 @@ namespace ClientInternalPC
             var protocol = useSecure.Equals("true", StringComparison.OrdinalIgnoreCase) ? "wss" : "ws";
             _relayUrl = $"{protocol}://{relayHost}:{relayPort}/relay?type=B&token={relayToken}";
 
-            _httpClient = new HttpClient();
+            // SSL 인증서 검증 우회 설정 (내부망 자체 서명 인증서용)
+            var ignoreSslErrors = ConfigurationManager.AppSettings["IgnoreSslErrors"] ?? "true";
+            if (ignoreSslErrors.Equals("true", StringComparison.OrdinalIgnoreCase))
+            {
+                // .NET Framework 4.5.2에서는 ServicePointManager 사용
+                // 전역적으로 모든 SSL 인증서 허용
+                System.Net.ServicePointManager.ServerCertificateValidationCallback = 
+                    delegate (object s, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors)
+                    {
+                        return true; // 모든 인증서 허용
+                    };
+                
+                // SSL 프로토콜 버전 설정 (TLS 1.2 이상)
+                System.Net.ServicePointManager.SecurityProtocol = 
+                    System.Net.SecurityProtocolType.Tls12 | 
+                    System.Net.SecurityProtocolType.Tls11 | 
+                    System.Net.SecurityProtocolType.Tls;
+            }
+
+            // HttpClientHandler 설정
+            var httpClientHandler = new HttpClientHandler();
+            
+            // 자동 리다이렉트 허용 (기본값: true)
+            httpClientHandler.AllowAutoRedirect = true;
+            
+            // 최대 리다이렉트 횟수 설정
+            httpClientHandler.MaxAutomaticRedirections = 10;
+
+            _httpClient = new HttpClient(httpClientHandler);
             _httpClient.Timeout = TimeSpan.FromSeconds(30);
+            
+            // User-Agent 설정 (일부 서버가 User-Agent 없으면 차단)
+            _httpClient.DefaultRequestHeaders.Add("User-Agent", "ClientB-Agent/1.0");
 
             // 허용된 도메인 목록 (설정에서 읽거나 기본값)
             var allowedDomainsConfig = ConfigurationManager.AppSettings["AllowedDomains"];
@@ -158,7 +191,12 @@ namespace ClientInternalPC
                     if (result.MessageType == WebSocketMessageType.Text)
                     {
                         var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                        Log($"[수신 루프] Text 메시지 수신 (길이: {result.Count}): {json?.Substring(0, Math.Min(50, json?.Length ?? 0))}...");
                         await HandleMessageAsync(json);
+                    }
+                    else if (result.MessageType == WebSocketMessageType.Binary)
+                    {
+                        Log($"[수신 루프] Binary 메시지 수신 (길이: {result.Count}) - 무시");
                     }
                 }
             }
@@ -173,6 +211,11 @@ namespace ClientInternalPC
         /// </summary>
         private async Task HandleMessageAsync(string json)
         {
+            // 디버깅: 메시지 수신 확인 (항상 첫 줄에 출력)
+            Log("=== HandleMessageAsync 호출됨 ===");
+            var jsonPreview = json?.Length > 100 ? json.Substring(0, 100) + "..." : json;
+            Log($"메시지 수신됨 (길이: {json?.Length ?? 0}): {jsonPreview}");
+            
             try
             {
                 var settings = new JsonSerializerSettings
@@ -187,11 +230,30 @@ namespace ClientInternalPC
                     return;
                 }
 
+                Log($"메시지 파싱 성공: Type={message.Type}, Method={message.Method ?? "null"}, Url={message.Url ?? "null"}, SessionId={message.SessionId ?? "null"}");
+
                 switch (message.Type.ToUpper())
                 {
                     case "REQUEST":
-                        // 비동기로 처리 (응답을 기다리지 않음)
-                        _ = Task.Run(() => HandleRequestAsync(message));
+                        Log($"REQUEST 메시지 처리 시작: {message.Method} {message.Url}");
+                        // 예외를 잡아서 로그 남기기
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await HandleRequestAsync(message);
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"HandleRequestAsync 예외: {ex.GetType().Name} - {ex.Message}");
+                                if (ex.InnerException != null)
+                                {
+                                    Log($"  내부: {ex.InnerException.GetType().Name} - {ex.InnerException.Message}");
+                                }
+                                // 에러 응답 전송
+                                await SendErrorResponseAsync(message.SessionId, 500, $"Request processing failed: {ex.Message}");
+                            }
+                        });
                         break;
 
                     case "PING":
@@ -320,7 +382,47 @@ namespace ClientInternalPC
             }
             catch (Exception ex)
             {
-                Log($"요청 처리 오류: {ex.Message}");
+                // 더 자세한 에러 정보 로깅
+                var errorDetails = $"요청 처리 오류 [{request.Method} {request.Url}]: {ex.GetType().Name} - {ex.Message}";
+                
+                if (ex.InnerException != null)
+                {
+                    errorDetails += $"\n  내부 오류: {ex.InnerException.GetType().Name} - {ex.InnerException.Message}";
+                }
+                
+                // HttpRequestException의 경우 추가 정보
+                if (ex is HttpRequestException httpEx)
+                {
+                    errorDetails += $"\n  HTTP 요청 실패";
+                    if (httpEx.InnerException != null)
+                    {
+                        errorDetails += $"\n  HTTP 내부: {httpEx.InnerException.GetType().Name} - {httpEx.InnerException.Message}";
+                    }
+                }
+                
+                // TaskCanceledException (타임아웃)의 경우
+                if (ex is TaskCanceledException)
+                {
+                    errorDetails += $"\n  타임아웃 발생 (30초 초과)";
+                }
+                
+                // SocketException의 경우
+                if (ex.InnerException is System.Net.Sockets.SocketException socketEx)
+                {
+                    errorDetails += $"\n  소켓 오류 코드: {socketEx.ErrorCode}, 소켓 오류: {socketEx.SocketErrorCode}";
+                }
+                
+                // AggregateException의 경우 (여러 예외 포함)
+                if (ex is AggregateException aggEx)
+                {
+                    errorDetails += $"\n  집계된 예외 {aggEx.InnerExceptions.Count}개:";
+                    foreach (var innerEx in aggEx.InnerExceptions)
+                    {
+                        errorDetails += $"\n    - {innerEx.GetType().Name}: {innerEx.Message}";
+                    }
+                }
+                
+                Log(errorDetails);
                 await SendErrorResponseAsync(request.SessionId, 500, $"Request failed: {ex.Message}");
             }
         }
