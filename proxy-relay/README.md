@@ -224,24 +224,33 @@ default-token-change-in-production
 #### 예시
 
 ```json
-// GET 요청
+// HTTP GET 요청
 {
   "type": "REQUEST",
   "method": "GET",
   "url": "http://internal-api.company.com/api/users/123"
 }
 
-// POST 요청
+// HTTPS GET 요청 (CONNECT 사용 안 함)
+{
+  "type": "REQUEST",
+  "method": "GET",
+  "url": "https://internal-api.company.com/api/users/123"
+}
+
+// HTTPS POST 요청
 {
   "type": "REQUEST",
   "method": "POST",
-  "url": "http://internal-api.company.com/api/users",
+  "url": "https://internal-api.company.com/api/users",
   "headers": {
     "Content-Type": "application/json"
   },
   "body": "{\"name\":\"John\",\"email\":\"john@example.com\"}"
 }
 ```
+
+**중요**: HTTPS 요청도 HTTP 요청과 동일하게 처리합니다. `url` 필드에 `https://` 프로토콜이 포함되어 있으면 Client B가 자동으로 HTTPS 요청을 수행합니다.
 
 ---
 
@@ -392,13 +401,41 @@ private async Task HandleRequestAsync(HttpListenerContext context)
 {
     var request = context.Request;
     
+    // HTTPS CONNECT 요청 처리 (브라우저가 보낼 수 있음)
+    if (request.HttpMethod == "CONNECT")
+    {
+        // CONNECT는 사용하지 않으므로 에러 반환
+        // 또는 URL을 추출하여 일반 REQUEST로 변환
+        var targetHost = request.Headers["Host"];
+        if (!string.IsNullOrEmpty(targetHost))
+        {
+            // CONNECT 요청을 일반 HTTPS GET 요청으로 변환
+            // (실제로는 브라우저가 보낸 원래 요청을 사용해야 함)
+            await context.Response.CloseAsync();
+            return;
+        }
+    }
+    
+    // 전체 URL 구성 (프로토콜 포함)
+    string fullUrl;
+    if (request.Url.IsAbsoluteUri)
+    {
+        fullUrl = request.Url.ToString();
+    }
+    else
+    {
+        // 상대 URL인 경우 절대 URL로 변환
+        var scheme = request.IsSecureConnection ? "https" : "http";
+        fullUrl = $"{scheme}://{request.Headers["Host"]}{request.Url}";
+    }
+    
     // RelayMessage 생성
     var relayMessage = new RelayMessage
     {
-        Type = "REQUEST",
+        Type = "REQUEST",  // 항상 REQUEST (CONNECT 사용 안 함)
         SessionId = Guid.NewGuid().ToString(),
-        Method = request.HttpMethod,
-        Url = request.Url.ToString(),
+        Method = request.HttpMethod,  // GET, POST, PUT, DELETE 등
+        Url = fullUrl,  // https:// 또는 http:// 포함한 전체 URL
         Headers = request.Headers.AllKeys.ToDictionary(
             k => k, 
             k => request.Headers[k]
@@ -470,12 +507,55 @@ private async Task SendPingAsync()
 }
 ```
 
+### HTTPS 요청 처리
+
+**중요**: 이 시스템은 **CONNECT 메서드를 사용하지 않습니다**. HTTPS 요청도 일반 HTTP 요청처럼 처리합니다.
+
+#### 처리 방식
+
+1. **브라우저의 HTTPS 요청 수신**
+   - 브라우저가 `https://internal-server.com/api/data` 요청
+   - Client A가 프록시로 요청을 받음
+
+2. **일반 REQUEST 메시지로 변환**
+   - URL에서 프로토콜(`https://`)과 전체 경로 추출
+   - `method`는 원래 HTTP 메서드 사용 (GET, POST 등)
+   - `type`은 항상 `"REQUEST"`로 설정
+
+3. **예시**
+
+```json
+// 브라우저: GET https://internal-api.company.com/api/users
+// Client A가 변환한 메시지:
+{
+  "type": "REQUEST",
+  "sessionId": "unique-id-123",
+  "method": "GET",
+  "url": "https://internal-api.company.com/api/users",
+  "headers": {
+    "User-Agent": "Mozilla/5.0...",
+    "Accept": "application/json"
+  }
+}
+```
+
+4. **Client B에서 HTTPS 요청 수행**
+   - Client B가 받은 URL(`https://...`)로 직접 HTTPS 요청 수행
+   - 내부 서버의 SSL 인증서 검증 (필요시 인증서 신뢰 설정)
+
+#### CONNECT 메서드 사용 금지
+
+- ❌ `type: "CONNECT"` 메시지 전송 금지
+- ❌ `method: "CONNECT"` 사용 금지
+- ✅ HTTPS URL을 그대로 사용하여 일반 REQUEST로 전송
+
 ### 주요 고려사항
 
-1. **HTTPS CONNECT 처리**: CONNECT 메서드는 터널링으로 처리
+1. **HTTPS 요청 처리**: CONNECT 없이 일반 REQUEST로 변환하여 전송
 2. **세션 관리**: sessionId로 요청-응답 매칭
 3. **타임아웃**: 장시간 응답 대기 시 타임아웃 처리
 4. **재연결**: 연결 끊김 시 자동 재연결 (선택사항)
+5. **SSL 인증서**: Client B에서 내부 서버의 SSL 인증서를 신뢰하도록 설정 필요
 
 ---
 
@@ -567,7 +647,7 @@ private async Task ReceiveMessagesAsync()
 }
 ```
 
-#### 3. 내부망 HTTP 요청 수행
+#### 3. 내부망 HTTP/HTTPS 요청 수행
 
 ```csharp
 private async Task HandleRequestAsync(RelayMessage request)
@@ -576,32 +656,57 @@ private async Task HandleRequestAsync(RelayMessage request)
     {
         using var httpClient = new HttpClient();
         
+        // HTTPS 요청을 위한 SSL 인증서 검증 설정 (필요시)
+        // 내부 서버의 자체 서명 인증서를 사용하는 경우:
+        // ServicePointManager.ServerCertificateValidationCallback = 
+        //     (sender, cert, chain, errors) => true;  // 개발 환경만
+        
         // 헤더 설정
         foreach (var header in request.Headers ?? new Dictionary<string, string>())
         {
-            if (header.Key.Equals("Content-Type", StringComparison.OrdinalIgnoreCase))
+            // 일부 헤더는 HttpClient에서 자동 처리되므로 제외
+            if (header.Key.Equals("Content-Type", StringComparison.OrdinalIgnoreCase) ||
+                header.Key.Equals("Accept", StringComparison.OrdinalIgnoreCase))
             {
                 httpClient.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
             }
         }
         
-        // HTTP 요청 생성
+        // HTTP/HTTPS 요청 생성
+        // request.Url은 이미 https:// 또는 http:// 포함
         HttpRequestMessage httpRequest = new HttpRequestMessage(
-            new HttpMethod(request.Method),
-            request.Url
+            new HttpMethod(request.Method),  // GET, POST, PUT, DELETE 등
+            request.Url  // https://internal-api.company.com/api/data
         );
         
+        // 요청 본문 설정
         if (!string.IsNullOrEmpty(request.Body))
         {
+            // Content-Type 헤더 확인
+            var contentType = request.Headers?.ContainsKey("Content-Type") == true
+                ? request.Headers["Content-Type"]
+                : "application/json";
+            
             httpRequest.Content = new StringContent(
                 request.Body,
                 Encoding.UTF8,
-                "application/json"
+                contentType
             );
         }
         
-        // 내부망 서버로 요청
+        // 내부망 서버로 요청 (HTTP 또는 HTTPS)
         var response = await httpClient.SendAsync(httpRequest);
+        
+        // 응답 헤더 수집
+        var responseHeaders = new Dictionary<string, string>();
+        foreach (var header in response.Headers)
+        {
+            responseHeaders[header.Key] = string.Join(", ", header.Value);
+        }
+        foreach (var header in response.Content.Headers)
+        {
+            responseHeaders[header.Key] = string.Join(", ", header.Value);
+        }
         
         // 응답 생성
         var relayResponse = new RelayMessage
@@ -609,10 +714,7 @@ private async Task HandleRequestAsync(RelayMessage request)
             Type = "RESPONSE",
             SessionId = request.SessionId,
             StatusCode = (int)response.StatusCode,
-            Headers = response.Headers.ToDictionary(
-                h => h.Key,
-                h => string.Join(", ", h.Value)
-            ),
+            Headers = responseHeaders,
             Body = await response.Content.ReadAsStringAsync()
         };
         
@@ -931,8 +1033,27 @@ namespace ProxyRelayClient
 ### Q4. HTTPS 요청은 어떻게 처리하나요?
 
 **A**: 
-- Client A에서 CONNECT 메서드를 터널링으로 처리
-- 또는 내부망 서버의 인증서를 신뢰하도록 설정
+- **CONNECT 메서드를 사용하지 않습니다**
+- HTTPS 요청도 일반 HTTP 요청처럼 처리합니다:
+  1. Client A가 브라우저의 HTTPS 요청을 받음
+  2. URL을 추출하여 (`https://internal-server.com/api/data`) 일반 REQUEST 메시지로 변환
+  3. `type: "REQUEST"`, `method: "GET"` (또는 POST 등), `url: "https://..."` 형태로 전송
+  4. Client B가 받은 URL로 직접 HTTPS 요청 수행
+  5. 응답을 JSON으로 변환하여 전달
+
+**예시**:
+```json
+// Client A가 보내는 메시지
+{
+  "type": "REQUEST",
+  "method": "GET",
+  "url": "https://internal-api.company.com/api/data"
+}
+```
+
+**주의사항**:
+- Client B에서 내부 서버의 SSL 인증서를 신뢰하도록 설정 필요 (자체 서명 인증서 사용 시)
+- 프로덕션 환경에서는 적절한 인증서 검증 로직 구현 권장
 
 ### Q5. 여러 Client A가 동시에 연결할 수 있나요?
 

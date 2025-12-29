@@ -161,6 +161,10 @@ public class MessageRoutingService {
     
     /**
      * JSON 메시지 파싱
+     * 
+     * 참고: HTTPS 요청은 CONNECT 메서드를 사용하지 않고, 일반 HTTP 요청처럼 처리합니다.
+     * Client A는 브라우저의 HTTPS 요청을 받아서 URL을 추출하고, 일반 REQUEST 메시지로 변환합니다.
+     * Client B는 내부 서버에 직접 HTTPS 요청을 수행하고, 응답을 JSON으로 변환하여 전달합니다.
      */
     public RelayMessage parseMessage(String json) {
         // 빈 메시지 체크
@@ -170,10 +174,43 @@ public class MessageRoutingService {
         }
         
         try {
-            return objectMapper.readValue(json, RelayMessage.class);
+            // 먼저 JSON을 Map으로 파싱하여 type 필드 확인
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, Object> rawMessage = objectMapper.readValue(json, java.util.Map.class);
+            
+            // CONNECT 타입이 오면 에러 (CONNECT는 사용하지 않음)
+            String typeStr = (String) rawMessage.get("type");
+            if ("CONNECT".equalsIgnoreCase(typeStr)) {
+                logger.error("CONNECT message type is not supported. Client A should convert HTTPS requests to regular REQUEST messages. Received JSON: {}", 
+                    json.length() > 200 ? json.substring(0, 200) + "..." : json);
+                return null;
+            }
+            
+            RelayMessage message = objectMapper.readValue(json, RelayMessage.class);
+            
+            // method가 CONNECT인 경우 경고 (Client A에서 변환해야 함)
+            if ("CONNECT".equalsIgnoreCase(message.getMethod())) {
+                logger.warn("Received request with method=CONNECT. CONNECT method should be converted to GET/POST/etc by Client A. URL: {}", 
+                    message.getUrl());
+            }
+            
+            return message;
+        } catch (com.fasterxml.jackson.databind.exc.InvalidFormatException e) {
+            // enum 파싱 에러인 경우 더 자세한 로그
+            if (e.getMessage() != null && e.getMessage().contains("MessageType")) {
+                logger.error("Invalid message type in JSON (length: {}): {}. Supported types: REQUEST, RESPONSE, PING, PONG", 
+                    json.length(), 
+                    json.length() > 200 ? json.substring(0, 200) + "..." : json);
+            } else {
+                logger.error("Error parsing message (length: {}): {}", 
+                    json.length(), 
+                    json.length() > 200 ? json.substring(0, 200) + "..." : json, e);
+            }
+            return null;
         } catch (Exception e) {
-            logger.error("Error parsing message (length: {}): {}", json.length(), 
-                json.length() > 100 ? json.substring(0, 100) + "..." : json, e);
+            logger.error("Error parsing message (length: {}): {}", 
+                json.length(), 
+                json.length() > 200 ? json.substring(0, 200) + "..." : json, e);
             return null;
         }
     }
