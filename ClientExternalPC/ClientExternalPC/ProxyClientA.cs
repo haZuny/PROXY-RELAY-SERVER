@@ -260,6 +260,7 @@ namespace ClientExternalPC
                     }
 
                     OnLogMessage($"[TCP CONNECT] 대상: {targetHost}:{targetPort}");
+                    OnLogMessage($"[TCP CONNECT] HTTPS는 필터링하지 않고 항상 직접 터널링합니다");
 
                     // 나머지 헤더 읽기 (무시)
                     string line;
@@ -268,213 +269,94 @@ namespace ClientExternalPC
                         // 헤더 읽기 (빈 줄까지)
                     }
 
-                    // 필터링 체크 (CONNECT 요청도 필터링 적용)
-                    Uri connectUri;
-                    try
-                    {
-                        // CONNECT 요청의 경우 https://host:port 형식으로 Uri 생성
-                        connectUri = new Uri($"https://{targetHost}:{targetPort}");
-                    }
-                    catch
-                    {
-                        // Uri 생성 실패 시 기본값 사용
-                        connectUri = new Uri($"https://{targetHost}");
-                    }
-
-                    bool shouldProxy = ShouldProxyRequest(connectUri);
+                    // HTTPS는 필터링 체크 없이 항상 직접 터널링
+                    OnLogMessage($"[TCP CONNECT 직접] {targetHost}:{targetPort} - HTTPS는 필터링 대상이 아니므로 직접 터널링");
                     
-                    if (!shouldProxy)
+                    // 대상 서버에 연결
+                    using (var targetClient = new TcpClient())
                     {
-                        // 필터링 대상이 아니면 직접 터널링
-                        OnLogMessage($"[TCP CONNECT 직접] {targetHost}:{targetPort} - 필터 목록에 없어 직접 터널링");
+                        await targetClient.ConnectAsync(targetHost, targetPort);
+                        OnLogMessage($"[TCP CONNECT] 대상 서버 연결 성공: {targetHost}:{targetPort}");
+
+                        // CONNECT 성공 응답
+                        await writer.WriteLineAsync("HTTP/1.1 200 Connection Established\r\n");
+                        await writer.FlushAsync();
+
+                        // 양방향 스트림 복사
+                        var targetStream = targetClient.GetStream();
+                        var clientStream = client.GetStream();
+
+                        // 클라이언트 -> 서버
+                        var copyToServer = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                var buffer = new byte[8192];
+                                int bytesRead;
+                                while ((bytesRead = await clientStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                                {
+                                    await targetStream.WriteAsync(buffer, 0, bytesRead);
+                                    await targetStream.FlushAsync();
+                                }
+                            }
+                            catch (ObjectDisposedException)
+                            {
+                                // 스트림이 이미 닫힌 경우 - 정상 종료
+                            }
+                            catch (Exception ex)
+                            {
+                                // 다른 예외만 로그
+                                if (!ex.Message.Contains("삭제된 개체") && !ex.Message.Contains("ObjectDisposed"))
+                                {
+                                    OnLogMessage($"[TCP CONNECT] 클라이언트->서버 스트림 오류: {ex.Message}");
+                                }
+                            }
+                        });
+
+                        // 서버 -> 클라이언트
+                        var copyToClient = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                var buffer = new byte[8192];
+                                int bytesRead;
+                                while ((bytesRead = await targetStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                                {
+                                    await clientStream.WriteAsync(buffer, 0, bytesRead);
+                                    await clientStream.FlushAsync();
+                                }
+                            }
+                            catch (ObjectDisposedException)
+                            {
+                                // 스트림이 이미 닫힌 경우 - 정상 종료
+                            }
+                            catch (Exception ex)
+                            {
+                                // 다른 예외만 로그
+                                if (!ex.Message.Contains("삭제된 개체") && !ex.Message.Contains("ObjectDisposed"))
+                                {
+                                    OnLogMessage($"[TCP CONNECT] 서버->클라이언트 스트림 오류: {ex.Message}");
+                                }
+                            }
+                        });
+
+                        // 양방향 중 하나라도 종료되면 대기
+                        try
+                        {
+                            await Task.WhenAny(copyToServer, copyToClient);
+                        }
+                        catch { }
                         
-                        // 대상 서버에 연결
-                        using (var targetClient = new TcpClient())
+                        // 스트림 정리
+                        try
                         {
-                            await targetClient.ConnectAsync(targetHost, targetPort);
-                            OnLogMessage($"[TCP CONNECT] 대상 서버 연결 성공: {targetHost}:{targetPort}");
-
-                            // CONNECT 성공 응답
-                            await writer.WriteLineAsync("HTTP/1.1 200 Connection Established\r\n");
-                            await writer.FlushAsync();
-
-                            // 양방향 스트림 복사
-                            var targetStream = targetClient.GetStream();
-                            var clientStream = client.GetStream();
-
-                            // 클라이언트 -> 서버
-                            var copyToServer = Task.Run(async () =>
-                            {
-                                try
-                                {
-                                    var buffer = new byte[8192];
-                                    int bytesRead;
-                                    while ((bytesRead = await clientStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
-                                    {
-                                        await targetStream.WriteAsync(buffer, 0, bytesRead);
-                                        await targetStream.FlushAsync();
-                                    }
-                                }
-                                catch (ObjectDisposedException)
-                                {
-                                    // 스트림이 이미 닫힌 경우 - 정상 종료
-                                }
-                                catch (Exception ex)
-                                {
-                                    // 다른 예외만 로그
-                                    if (!ex.Message.Contains("삭제된 개체") && !ex.Message.Contains("ObjectDisposed"))
-                                    {
-                                        OnLogMessage($"[TCP CONNECT] 클라이언트->서버 스트림 오류: {ex.Message}");
-                                    }
-                                }
-                            });
-
-                            // 서버 -> 클라이언트
-                            var copyToClient = Task.Run(async () =>
-                            {
-                                try
-                                {
-                                    var buffer = new byte[8192];
-                                    int bytesRead;
-                                    while ((bytesRead = await targetStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
-                                    {
-                                        await clientStream.WriteAsync(buffer, 0, bytesRead);
-                                        await clientStream.FlushAsync();
-                                    }
-                                }
-                                catch (ObjectDisposedException)
-                                {
-                                    // 스트림이 이미 닫힌 경우 - 정상 종료
-                                }
-                                catch (Exception ex)
-                                {
-                                    // 다른 예외만 로그
-                                    if (!ex.Message.Contains("삭제된 개체") && !ex.Message.Contains("ObjectDisposed"))
-                                    {
-                                        OnLogMessage($"[TCP CONNECT] 서버->클라이언트 스트림 오류: {ex.Message}");
-                                    }
-                                }
-                            });
-
-                            // 양방향 중 하나라도 종료되면 대기
-                            try
-                            {
-                                await Task.WhenAny(copyToServer, copyToClient);
-                            }
-                            catch { }
-                            
-                            // 스트림 정리
-                            try
-                            {
-                                targetStream?.Close();
-                            }
-                            catch { }
-                            
-                            OnLogMessage($"[TCP CONNECT] 터널링 종료: {targetHost}:{targetPort}");
+                            targetStream?.Close();
                         }
-                        return;
+                        catch { }
+                        
+                        OnLogMessage($"[TCP CONNECT] 터널링 종료: {targetHost}:{targetPort}");
                     }
-
-                    // 필터링 대상이면 Relay Server로 전달
-                    OnLogMessage($"[TCP CONNECT Relay 경유] {targetHost}:{targetPort} - 필터 목록에 있어 Relay Server 경유");
-                    
-                    // WebSocket 연결 상태 확인
-                    if (_webSocket == null || _webSocket.State != WebSocketState.Open)
-                    {
-                        OnLogMessage($"[TCP CONNECT Relay 실패] WebSocket이 연결되지 않았습니다. 상태: {_webSocket?.State ?? WebSocketState.None}");
-                        await writer.WriteLineAsync("HTTP/1.1 502 Bad Gateway\r\n");
-                        await writer.FlushAsync();
-                        return;
-                    }
-
-                    // Relay Server로 CONNECT 요청 전송
-                    var sessionId = Guid.NewGuid().ToString();
-                    var relayMessage = new RelayMessage
-                    {
-                        Type = "CONNECT",
-                        SessionId = sessionId,
-                        Method = "CONNECT",
-                        Url = connectUri.ToString(),
-                        Headers = new Dictionary<string, string>()
-                    };
-
-                    // Relay Server로 전송
-                    OnLogMessage($"[TCP CONNECT Relay 전송] {targetHost}:{targetPort} (SessionId: {sessionId})");
-                    await SendMessageAsync(relayMessage);
-
-                    // 응답 대기
-                    var tcs = new TaskCompletionSource<RelayMessage>();
-                    lock (_pendingRequests)
-                    {
-                        _pendingRequests[sessionId] = tcs;
-                    }
-
-                    try
-                    {
-                        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(60));
-                        var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
-
-                        if (completedTask == timeoutTask)
-                        {
-                            lock (_pendingRequests)
-                            {
-                                _pendingRequests.Remove(sessionId);
-                            }
-                            OnLogMessage($"[TCP CONNECT Relay 타임아웃] {targetHost}:{targetPort} - 60초 내 응답 없음");
-                            await writer.WriteLineAsync("HTTP/1.1 504 Gateway Timeout\r\n");
-                            await writer.FlushAsync();
-                            return;
-                        }
-
-                        var relayResponse = await tcs.Task;
-                        lock (_pendingRequests)
-                        {
-                            _pendingRequests.Remove(sessionId);
-                        }
-
-                        // Relay Server 응답 처리
-                        var statusCode = relayResponse.StatusCode ?? 500;
-                        OnLogMessage($"[TCP CONNECT Relay 응답] {targetHost}:{targetPort} - Status: {statusCode}");
-
-                        if (statusCode == 200)
-                        {
-                            // CONNECT 성공 응답
-                            await writer.WriteLineAsync("HTTP/1.1 200 Connection Established\r\n");
-                            await writer.FlushAsync();
-                            OnLogMessage($"[TCP CONNECT Relay 성공] {targetHost}:{targetPort} - 터널링 시작 (주의: Relay Server가 바이너리 스트리밍을 지원하지 않으면 작동하지 않을 수 있음)");
-                            
-                            // TODO: Relay Server를 통한 바이너리 스트리밍 구현 필요
-                            // 현재는 Relay Server가 JSON 메시지만 처리하므로 실제 터널링은 불가능
-                            // Relay Server 측에서 바이너리 스트리밍을 지원하도록 수정 필요
-                            OnLogMessage($"[TCP CONNECT Relay 경고] Relay Server가 바이너리 스트리밍을 지원하지 않아 실제 터널링이 불가능합니다.");
-                            
-                            // 현재는 연결을 종료 (실제 터널링은 Relay Server 지원 후 구현)
-                            return;
-                        }
-                        else
-                        {
-                            // CONNECT 실패
-                            await writer.WriteLineAsync($"HTTP/1.1 {statusCode} {GetStatusDescription(statusCode)}\r\n");
-                            if (!string.IsNullOrEmpty(relayResponse.Error))
-                            {
-                                var errorBody = Encoding.UTF8.GetBytes($"CONNECT failed: {relayResponse.Error}");
-                                await stream.WriteAsync(errorBody, 0, errorBody.Length);
-                            }
-                            await writer.FlushAsync();
-                            return;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        lock (_pendingRequests)
-                        {
-                            _pendingRequests.Remove(sessionId);
-                        }
-                        OnLogMessage($"[TCP CONNECT Relay 오류] 응답 처리 오류: {ex.Message}");
-                        await writer.WriteLineAsync("HTTP/1.1 502 Bad Gateway\r\n");
-                        await writer.FlushAsync();
-                        return;
-                    }
+                    return;
                 }
                 else
                 {
@@ -1620,195 +1502,12 @@ namespace ClientExternalPC
                         targetPort = parsedPort;
                     }
                 }
-                OnLogMessage($"[CONNECT] HTTPS 터널링 요청 수신: {rawUrl} -> {targetHost}:{targetPort}");
+                OnLogMessage($"[CONNECT] HTTPS CONNECT 요청 수신: {rawUrl} -> {targetHost}:{targetPort}");
+                OnLogMessage($"[CONNECT] HTTPS는 필터링하지 않고 항상 직접 터널링합니다");
 
-                // 필터링 체크
-                Uri connectUri;
-                try
-                {
-                    connectUri = new Uri($"https://{targetHost}:{targetPort}");
-                }
-                catch
-                {
-                    connectUri = new Uri($"https://{targetHost}");
-                }
-
-                OnLogMessage($"[CONNECT 필터링 체크 시작] {targetHost}:{targetPort} - Uri: {connectUri}");
-                bool shouldProxy = ShouldProxyRequest(connectUri);
-                OnLogMessage($"[CONNECT 필터링 결과] {targetHost}:{targetPort} - shouldProxy: {shouldProxy}");
-
-                if (!shouldProxy)
-                {
-                    // 필터링 대상이 아니면 직접 터널링
-                    OnLogMessage($"[CONNECT 직접 터널링] {targetHost}:{targetPort} - 필터 목록에 없어 직접 터널링");
-                    await HandleDirectConnectAsync(context, targetHost);
-                    return;
-                }
-
-                // 필터링 대상이면 Relay Server로 전달
-                OnLogMessage($"[CONNECT Relay 경유 결정] {targetHost}:{targetPort} - 필터 목록에 있어 Relay Server 경유");
-                OnLogMessage($"[CONNECT Relay 준비] WebSocket 상태 확인 중...");
-                
-                // WebSocket 연결 상태 확인
-                if (_webSocket == null || _webSocket.State != WebSocketState.Open)
-                {
-                    OnLogMessage($"[CONNECT Relay 실패] WebSocket이 연결되지 않았습니다. 상태: {_webSocket?.State ?? WebSocketState.None}");
-                    response.StatusCode = 502;
-                    response.StatusDescription = "Bad Gateway - WebSocket not connected";
-                    response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
-                    response.Headers.Set("Pragma", "no-cache");
-                    response.Headers.Set("Expires", "0");
-                    response.Headers.Set("Retry-After", "3600");
-                    response.Headers.Set("Connection", "close");
-                    response.ContentLength64 = 0;
-                    response.Close();
-                    return;
-                }
-
-                // Relay Server로 CONNECT 요청 전송
-                var sessionId = Guid.NewGuid().ToString();
-                OnLogMessage($"[CONNECT Relay 메시지 생성] SessionId: {sessionId}, Url: {connectUri}");
-                
-                var relayMessage = new RelayMessage
-                {
-                    Type = "CONNECT",
-                    SessionId = sessionId,
-                    Method = "CONNECT",
-                    Url = connectUri.ToString(),
-                    Headers = new Dictionary<string, string>()
-                };
-
-                // 헤더 복사
-                OnLogMessage($"[CONNECT Relay 헤더 복사] 요청 헤더 개수: {request.Headers.Count}");
-                foreach (string key in request.Headers.AllKeys)
-                {
-                    if (!key.StartsWith("Proxy-", StringComparison.OrdinalIgnoreCase) &&
-                        !key.Equals("Connection", StringComparison.OrdinalIgnoreCase) &&
-                        !key.Equals("Keep-Alive", StringComparison.OrdinalIgnoreCase))
-                    {
-                        relayMessage.Headers[key] = request.Headers[key];
-                        OnLogMessage($"[CONNECT Relay 헤더] {key}: {request.Headers[key]}");
-                    }
-                }
-                OnLogMessage($"[CONNECT Relay 헤더 복사 완료] 복사된 헤더 개수: {relayMessage.Headers.Count}");
-
-                // Relay Server로 전송
-                OnLogMessage($"[CONNECT Relay 전송 시작] {targetHost}:{targetPort} (SessionId: {sessionId})");
-                try
-                {
-                    await SendMessageAsync(relayMessage);
-                    OnLogMessage($"[CONNECT Relay 전송 완료] {targetHost}:{targetPort} (SessionId: {sessionId}) - Relay Server로 전송 성공");
-                }
-                catch (Exception sendEx)
-                {
-                    OnLogMessage($"[CONNECT Relay 전송 실패] {targetHost}:{targetPort} (SessionId: {sessionId}) - 오류: {sendEx.Message}");
-                    if (sendEx.InnerException != null)
-                    {
-                        OnLogMessage($"[CONNECT Relay 전송 실패 상세] 내부 오류: {sendEx.InnerException.Message}");
-                    }
-                    throw;
-                }
-
-                // 응답 대기
-                var tcs = new TaskCompletionSource<RelayMessage>();
-                lock (_pendingRequests)
-                {
-                    _pendingRequests[sessionId] = tcs;
-                }
-
-                try
-                {
-                    var timeoutTask = Task.Delay(TimeSpan.FromSeconds(60));
-                    var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
-
-                    if (completedTask == timeoutTask)
-                    {
-                        lock (_pendingRequests)
-                        {
-                            _pendingRequests.Remove(sessionId);
-                        }
-                        OnLogMessage($"[CONNECT Relay 타임아웃] {targetHost}:{targetPort} - 60초 내 응답 없음");
-                        response.StatusCode = 504;
-                        response.StatusDescription = "Gateway Timeout";
-                        response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
-                        response.Headers.Set("Pragma", "no-cache");
-                        response.Headers.Set("Expires", "0");
-                        response.Headers.Set("Retry-After", "3600");
-                        response.Headers.Set("Connection", "close");
-                        response.ContentLength64 = 0;
-                        response.Close();
-                        return;
-                    }
-
-                    var relayResponse = await tcs.Task;
-                    lock (_pendingRequests)
-                    {
-                        _pendingRequests.Remove(sessionId);
-                    }
-
-                    // Relay Server 응답 처리
-                    var statusCode = relayResponse.StatusCode ?? 500;
-                    OnLogMessage($"[CONNECT Relay 응답] {targetHost}:{targetPort} - Status: {statusCode}");
-
-                    if (statusCode == 200)
-                    {
-                        // CONNECT 성공 - 터널링 시작
-                        // 주의: Relay Server가 바이너리 스트리밍을 지원하지 않으면 이 부분은 작동하지 않을 수 있음
-                        response.StatusCode = 200;
-                        response.StatusDescription = "Connection Established";
-                        response.Headers.Clear();
-                        response.Headers.Add("Connection", "keep-alive");
-                        response.SendChunked = false;
-                        response.ContentLength64 = 0;
-                        await response.OutputStream.FlushAsync();
-                        OnLogMessage($"[CONNECT Relay 성공] {targetHost}:{targetPort} - 터널링 시작 (주의: Relay Server가 바이너리 스트리밍을 지원하지 않으면 작동하지 않을 수 있음)");
-                        
-                        // TODO: Relay Server를 통한 바이너리 스트리밍 구현 필요
-                        // 현재는 Relay Server가 JSON 메시지만 처리하므로 실제 터널링은 불가능
-                        // Relay Server 측에서 바이너리 스트리밍을 지원하도록 수정 필요
-                        OnLogMessage($"[CONNECT Relay 경고] Relay Server가 바이너리 스트리밍을 지원하지 않아 실제 터널링이 불가능합니다.");
-                        response.Close();
-                    }
-                    else
-                    {
-                        // CONNECT 실패
-                        response.StatusCode = statusCode;
-                        response.StatusDescription = GetStatusDescription(statusCode);
-                        response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
-                        response.Headers.Set("Pragma", "no-cache");
-                        response.Headers.Set("Expires", "0");
-                        response.Headers.Set("Retry-After", "3600");
-                        response.Headers.Set("Connection", "close");
-                        if (!string.IsNullOrEmpty(relayResponse.Error))
-                        {
-                            var errorBody = Encoding.UTF8.GetBytes($"CONNECT failed: {relayResponse.Error}");
-                            response.ContentLength64 = errorBody.Length;
-                            await response.OutputStream.WriteAsync(errorBody, 0, errorBody.Length);
-                        }
-                        else
-                        {
-                            response.ContentLength64 = 0;
-                        }
-                        response.Close();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    lock (_pendingRequests)
-                    {
-                        _pendingRequests.Remove(sessionId);
-                    }
-                    OnLogMessage($"[CONNECT Relay 오류] 응답 처리 오류: {ex.Message}");
-                    response.StatusCode = 502;
-                    response.StatusDescription = "Bad Gateway";
-                    response.Headers.Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
-                    response.Headers.Set("Pragma", "no-cache");
-                    response.Headers.Set("Expires", "0");
-                    response.Headers.Set("Retry-After", "3600");
-                    response.Headers.Set("Connection", "close");
-                    response.ContentLength64 = 0;
-                    response.Close();
-                }
+                // HTTPS는 필터링 체크 없이 항상 직접 터널링
+                OnLogMessage($"[CONNECT 직접 터널링] {targetHost}:{targetPort} - HTTPS는 필터링 대상이 아니므로 직접 터널링");
+                await HandleDirectConnectAsync(context, targetHost);
                 return;
             }
             catch (Exception ex)
